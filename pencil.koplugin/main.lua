@@ -51,6 +51,10 @@ local UNDERLINE_MIN_LENGTH = 40        -- Shorter strokes are never underlines
 local UNDERLINE_MAX_SLOPE = 0.25       -- Max stroke height / width
 local UNDERLINE_SEARCH_PIXELS = 48     -- How far above the stroke to look for text
 
+-- Palm rejection: touches that start while the pen is near the screen, or
+-- within this long after the pen was last seen, are dropped.
+local PALM_GRACE_MS = 800
+
 -- Annotation grouping constants
 local GROUP_TIME_THRESHOLD_S = 10   -- seconds between strokes to be grouped
 local GROUP_SPATIAL_THRESHOLD = 200 -- pixels between bboxes to be grouped
@@ -71,6 +75,7 @@ local STROKES_PATH_SETTING = "pencil_strokes_path"
 -- to find the live plugin without coupling to KOReader internals.
 local _active_pencil = nil
 local _bookmark_hook_installed = false
+local _palm_filter_installed = false
 
 local Pencil = InputContainer:extend{
     name = "pencil_annotation",
@@ -341,6 +346,68 @@ function Pencil:setupStylusCallback()
 
     self.stylus_callback_registered = true
     logger.info("Pencil: stylus callback registered")
+    self:installPalmFilter(Input)
+end
+
+-- Wrap Input:routeStylusEvents (runs on every touch frame, before gesture
+-- detection) so finger slots can be dropped while the pen is in use.
+-- Installed once per Input object; it defers to the active plugin instance.
+function Pencil:installPalmFilter(input)
+    if _palm_filter_installed or not input.routeStylusEvents then return end
+    local route = input.routeStylusEvents
+    input.routeStylusEvents = function(inp, ...)
+        route(inp, ...)
+        if _active_pencil then
+            _active_pencil:filterPalmSlots(inp)
+        end
+    end
+    _palm_filter_installed = true
+end
+
+-- Drop finger contacts that start while the pen is near or was just used.
+-- A dropped contact stays dropped until its lift (which is dropped too), and
+-- contacts that started before stay untouched, so the gesture detector never
+-- sees half a contact.
+function Pencil:filterPalmSlots(input)
+    local slots = input.MTSlots
+    if not slots or #slots == 0 then return end
+    self.palm_slots = self.palm_slots or {}
+    self.finger_slots = self.finger_slots or {}
+    local enabled = self.palm_rejection and self:isEnabled()
+
+    local suppress = false
+    if enabled then
+        local pen = input.ev_slots and input.pen_slot and input.ev_slots[input.pen_slot]
+        local pen_tool = pen and pen.tool
+        if pen_tool == 1 or pen_tool == 2 then
+            suppress = true  -- pen (tip or eraser) is in proximity
+        elseif self.last_stylus_time
+                and time.to_ms(time.now() - self.last_stylus_time) <= PALM_GRACE_MS then
+            suppress = true
+        end
+    end
+
+    for i = #slots, 1, -1 do
+        local s = slots[i]
+        local is_pen = s.slot == input.pen_slot or s.tool == 1 or s.tool == 2 or s.tool == 3
+        if not is_pen and s.slot ~= nil then
+            local key = s.slot
+            local lifting = not s.id or s.id < 0
+            if self.palm_slots[key] then
+                table.remove(slots, i)
+                if lifting then self.palm_slots[key] = nil end
+            elseif self.finger_slots[key] then
+                if lifting then self.finger_slots[key] = nil end
+            elseif not lifting then
+                if suppress then
+                    self.palm_slots[key] = true
+                    table.remove(slots, i)
+                else
+                    self.finger_slots[key] = true
+                end
+            end
+        end
+    end
 end
 
 -- Transform stylus coordinates based on screen rotation
@@ -355,6 +422,8 @@ end
 -- slot = {slot=N, id=N, x=N, y=N, tool=N, timev=timestamp}
 -- id >= 0 means contact active, id == -1 means contact lifted
 function Pencil:handleStylusSlot(input, slot)
+    -- Remembered for palm rejection (see filterPalmSlots)
+    self.last_stylus_time = time.now()
     -- Tool types from Linux input subsystem
     local TOOL_TYPE_PEN = 1
     local TOOL_TYPE_ERASER = 2
@@ -1173,6 +1242,7 @@ function Pencil:loadSettings()
     self.experimental_color_picker = settings.experimental_color_picker or false
     self.experimental_text_highlight = settings.experimental_text_highlight or false
     self.underline_hold = settings.underline_hold ~= false
+    self.palm_rejection = settings.palm_rejection ~= false
     -- Load pen color by name and look up the actual color value
     local color_name = settings.pen_color_name
     if color_name then
@@ -1207,6 +1277,7 @@ function Pencil:saveSettings()
         experimental_color_picker = self.experimental_color_picker,
         experimental_text_highlight = self.experimental_text_highlight,
         underline_hold = self.underline_hold,
+        palm_rejection = self.palm_rejection,
         pen_color_name = self.tool_settings[TOOL_PEN].color_name,
         swap_eraser_and_highlighter = self.swap_eraser_and_highlighter,
         pen_width = self.tool_settings[TOOL_PEN].width,
@@ -1429,6 +1500,17 @@ function Pencil:addToMainMenu(menu_items)
                         end,
                         callback = function()
                             self.underline_hold = not self.underline_hold
+                            self:saveSettings()
+                        end,
+                    },
+                    {
+                        text = _("Ignore touch while writing"),
+                        help_text = _("Ignore finger and palm touches that start while the pen is near the screen or was just used, so a resting hand doesn't turn pages or open menus. Move the pen away to use touch again."),
+                        checked_func = function()
+                            return self.palm_rejection
+                        end,
+                        callback = function()
+                            self.palm_rejection = not self.palm_rejection
                             self:saveSettings()
                         end,
                     },
