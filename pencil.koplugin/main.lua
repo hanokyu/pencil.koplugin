@@ -20,7 +20,9 @@ local VerticalSpan = require("ui/widget/verticalspan")
 local PencilGeometry = require("lib/geometry")
 local Screen = Device.screen
 local Size = require("ui/size")
+local Font = require("ui/font")
 local InfoMessage = require("ui/widget/infomessage")
+local TextWidget = require("ui/widget/textwidget")
 local InputContainer = require("ui/widget/container/inputcontainer")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
@@ -76,6 +78,8 @@ local STROKES_PATH_SETTING = "pencil_strokes_path"
 local _active_pencil = nil
 local _bookmark_hook_installed = false
 local _palm_filter_installed = false
+
+local NoteCanvas  -- defined with the notes code below
 
 local Pencil = InputContainer:extend{
     name = "pencil_annotation",
@@ -445,6 +449,9 @@ end
 function Pencil:handleStylusSlot(input, slot)
     -- Remembered for palm rejection (see filterPalmSlots)
     self.last_stylus_time = time.now()
+    if self.note_canvas then
+        return self.note_canvas:handleStylus(slot)
+    end
     -- Tool types from Linux input subsystem
     local TOOL_TYPE_PEN = 1
     local TOOL_TYPE_ERASER = 2
@@ -619,10 +626,23 @@ function Pencil:handleStylusSlot(input, slot)
         return true  -- Dominate: remove from gesture detection
     end
 
+    if self.lasso then
+        return self:handleLassoSlot(slot)
+    end
+
     -- Handle pen/highlighter mode
     if slot.id and slot.id >= 0 then
         -- Pen down or moving
         if not self.pen_down then
+            -- Pen down on a note marker opens the note.
+            if self.notes and #self.notes > 0 then
+                local mx, my = self:transformCoordinates(slot.x or 0, slot.y or 0)
+                local note = self:findNoteMarkerAt(mx, my)
+                if note then
+                    self:openNote(note, true)
+                    return true
+                end
+            end
             -- Check if color picker is showing - route pen tap to it
             if self.color_picker_showing and self.color_picker_widget then
                 local raw_x = slot.x or 0
@@ -659,7 +679,7 @@ function Pencil:handleStylusSlot(input, slot)
             -- avoids an UIManager:scheduleIn closure allocation on every
             -- pen-down — real GC pressure on the A53 during multi-second
             -- strokes.
-            if self.experimental_color_picker or self.experimental_pen_width then
+            if self.hold_menu or self.experimental_color_picker or self.experimental_pen_width then
                 self.color_picker_start_x = x
                 self.color_picker_start_y = y
                 self.color_picker_start_time = time.now()
@@ -1268,6 +1288,7 @@ function Pencil:loadSettings()
     self.experimental_text_highlight = settings.experimental_text_highlight or false
     self.underline_hold = settings.underline_hold ~= false
     self.palm_rejection = settings.palm_rejection ~= false
+    self.hold_menu = settings.hold_menu ~= false
     -- Load pen color by name and look up the actual color value
     local color_name = settings.pen_color_name
     if color_name then
@@ -1303,6 +1324,7 @@ function Pencil:saveSettings()
         experimental_text_highlight = self.experimental_text_highlight,
         underline_hold = self.underline_hold,
         palm_rejection = self.palm_rejection,
+        hold_menu = self.hold_menu,
         pen_color_name = self.tool_settings[TOOL_PEN].color_name,
         swap_eraser_and_highlighter = self.swap_eraser_and_highlighter,
         pen_width = self.tool_settings[TOOL_PEN].width,
@@ -1524,6 +1546,17 @@ function Pencil:addToMainMenu(menu_items)
                                     timeout = 2,
                                 })
                             end
+                        end,
+                    },
+                    {
+                        text = _("Tool menu when holding the pen still"),
+                        help_text = _("Hold the pen still on the page for a moment to open a menu with Undo, Redo, Lasso and Note (plus colors and widths when those options are on)."),
+                        checked_func = function()
+                            return self.hold_menu
+                        end,
+                        callback = function()
+                            self.hold_menu = not self.hold_menu
+                            self:saveSettings()
                         end,
                     },
                     {
@@ -1898,8 +1931,7 @@ function Pencil:applyHistoryAction(action, undoing)
         end
         return { type = "delete", strokes = action.strokes }
     elseif action.type == "move" then
-        local sign = undoing and -1 or 1
-        self:translateStrokes(action.strokes, sign * action.dx, sign * action.dy)
+        self:translateStrokes(action.strokes, action.dx, action.dy, action.pdeltas, undoing and -1 or 1)
         return action
     end
 end
@@ -2172,7 +2204,7 @@ function Pencil:checkColorPickerTrigger()
     -- Gated behind the two experimental flags. At least one must be on for
     -- the hold-pen-still gesture to produce anything; otherwise the pen
     -- stays on its last-saved color/width.
-    if not (self.experimental_color_picker or self.experimental_pen_width) then return end
+    if not (self.hold_menu or self.experimental_color_picker or self.experimental_pen_width) then return end
     if not self.color_picker_start_time then return end
     if self.color_picker_showing then return end
 
@@ -2221,11 +2253,12 @@ end
 local ColorPickerWidget = InputContainer:extend {
     width = nil,
     height = nil,
+    actions = nil, -- Optional array of {action, label} objects (hold-pen tool menu)
     colors = nil, -- Array of {color, name} objects
     widths = nil, -- Optional array of {name, width} objects (experimental width picker)
     current_color_name = nil, -- Currently selected color name (for comparison)
     current_width = nil, -- Currently selected pen width (for width selection indicator)
-    callback = nil,
+    callback = nil, -- callback(color_value, color_name, width_value, action)
     close_callback = nil,
     -- Layout constants cached after init so handlePenTap / paintTo don't
     -- recompute them. Kept on self so tests can read them too.
@@ -2235,21 +2268,41 @@ local ColorPickerWidget = InputContainer:extend {
     _padding = nil,
 }
 
--- Build one button (color or width). Returns the InputContainer button, which
--- also stores its own color / width metadata so the callback can route without
--- string-matching on name.
-function ColorPickerWidget:_makeButton(item, button_size, selection_border)
+-- Build one button (action, color or width). Returns the InputContainer
+-- button, which also stores its own metadata so the callback can route
+-- without string-matching on name.
+function ColorPickerWidget:_makeButton(item, button_size, selection_border, button_w)
+    button_w = button_w or button_size
     -- Selection: colors compare by name, widths compare by width value
     local is_selected
     if item.kind == "width" then
         is_selected = (item.width_value == self.current_width)
-    else
+    elseif item.kind == "color" then
         is_selected = (item.name == self.current_color_name)
     end
     local border_size = is_selected and selection_border or Size.border.thick
 
     local swatch
-    if item.kind == "width" then
+    if item.kind == "action" then
+        local inner_w, inner_h = button_w - border_size * 2, button_size - border_size * 2
+        swatch = FrameContainer:new{
+            width = button_w,
+            height = button_size,
+            padding = 0,
+            margin = 0,
+            bordersize = border_size,
+            color = Blitbuffer.COLOR_BLACK,
+            background = Blitbuffer.COLOR_WHITE,
+            CenterContainer:new{
+                dimen = Geom:new{ w = inner_w, h = inner_h },
+                TextWidget:new{
+                    text = item.label,
+                    face = Font:getFace("cfont", 16),
+                    max_width = inner_w,
+                },
+            },
+        }
+    elseif item.kind == "width" then
         -- Truthful preview: a horizontal black bar whose height equals the
         -- stroke's actual device-pixel thickness. We deliberately do NOT
         -- scale by Screen:scaleBySize — the stroke itself is drawn in raw
@@ -2306,12 +2359,13 @@ function ColorPickerWidget:_makeButton(item, button_size, selection_border)
     end
 
     local button = InputContainer:new{
-        dimen = Geom:new{ w = button_size, h = button_size },
+        dimen = Geom:new{ w = button_w, h = button_size },
         swatch,
         kind = item.kind,
-        color_value = item.color_value,  -- nil for width items
+        action = item.action,            -- nil unless an action button
+        color_value = item.color_value,  -- nil for width/action items
         color_name = item.name,
-        width_value = item.width_value,  -- nil for color items
+        width_value = item.width_value,  -- nil for color/action items
     }
 
     button.ges_events = {
@@ -2325,27 +2379,33 @@ function ColorPickerWidget:_makeButton(item, button_size, selection_border)
 
     local widget = self
     button.onTapSelectColor = function(btn)
-        if widget.callback then
-            widget.callback(btn.color_value, btn.color_name, btn.width_value)
-        end
-        if widget.close_callback then
-            widget.close_callback()
-        end
+        widget:_activate(btn)
         return true
     end
 
     return button
 end
 
+-- Run the callback for a tapped button, then close the picker.
+function ColorPickerWidget:_activate(btn)
+    -- Close first so an action (e.g. opening the note canvas) isn't drawn under it.
+    if self.close_callback then
+        self.close_callback()
+    end
+    if self.callback then
+        self.callback(btn.color_value, btn.color_name, btn.width_value, btn.action)
+    end
+end
+
 -- Build a HorizontalGroup row of buttons from an item list. Populates the
 -- supplied `info_list` in-tap-index order.
-function ColorPickerWidget:_buildRow(items, button_size, spacing, selection_border, info_list)
+function ColorPickerWidget:_buildRow(items, button_size, spacing, selection_border, info_list, button_w)
     local group = HorizontalGroup:new{ align = "center" }
     for i, item in ipairs(items) do
         if i > 1 then
             table.insert(group, HorizontalSpan:new{ width = spacing })
         end
-        local button = self:_makeButton(item, button_size, selection_border)
+        local button = self:_makeButton(item, button_size, selection_border, button_w)
         table.insert(group, button)
         table.insert(info_list, button)
     end
@@ -2355,7 +2415,7 @@ end
 function ColorPickerWidget:init()
     local button_size = Screen:scaleBySize(36)
     local spacing = Screen:scaleBySize(8)
-    local row_gap = Screen:scaleBySize(8)  -- vertical gap between color row and width row
+    local row_gap = Screen:scaleBySize(8)  -- vertical gap between rows
     local padding = Screen:scaleBySize(10)
     local selection_border = Size.border.thick * 3
 
@@ -2364,76 +2424,59 @@ function ColorPickerWidget:init()
     self._row_gap = row_gap
     self._padding = padding
 
-    -- Build optional color row. `colors` is nil when the color-picker
-    -- experimental flag is off; in that case we render a widths-only picker.
-    local has_colors = self.colors and #self.colors > 0
+    -- Rows, top to bottom: actions, colors, widths. Each is optional.
+    self.rows = {}
+    self.action_buttons_info = {}
     self.color_buttons_info = {}
-    local color_row_group
-    local colors_row_width = 0
-    if has_colors then
-        local color_items = {}
-        for _, color_info in ipairs(self.colors) do
-            table.insert(color_items, {
-                kind = "color",
-                name = color_info.name,
-                color_value = color_info.color,
-            })
-        end
-        color_row_group = self:_buildRow(color_items, button_size, spacing, selection_border, self.color_buttons_info)
-        colors_row_width = #color_items * button_size + (#color_items - 1) * spacing
-    end
-
-    -- Build optional width row
-    local has_widths = self.widths and #self.widths > 0
     self.width_buttons_info = {}
-    local width_row_group
-    local widths_row_width = 0
-    if has_widths then
-        local width_items = {}
-        for _, width_info in ipairs(self.widths) do
-            table.insert(width_items, {
-                kind = "width",
-                name = width_info.name,
-                width_value = width_info.width,
-            })
-        end
-        width_row_group = self:_buildRow(width_items, button_size, spacing, selection_border, self.width_buttons_info)
-        widths_row_width = #width_items * button_size + (#width_items - 1) * spacing
+
+    local function add_row(items, info_list, button_w)
+        if not items or #items == 0 then return end
+        local group = self:_buildRow(items, button_size, spacing, selection_border, info_list, button_w)
+        table.insert(self.rows, {
+            info = info_list,
+            button_w = button_w,
+            width = #items * button_w + (#items - 1) * spacing,
+            group = group,
+        })
     end
 
-    -- Inner width accommodates the wider of the visible rows. Height
-    -- accumulates one button_size per visible row plus a gap when both
-    -- are showing.
-    local visible_rows = (has_colors and 1 or 0) + (has_widths and 1 or 0)
-    local inner_w = math.max(colors_row_width, widths_row_width)
-    self.width = inner_w
-    self.height = visible_rows * button_size + (visible_rows > 1 and row_gap or 0)
+    if self.actions then
+        local items = {}
+        for _, a in ipairs(self.actions) do
+            table.insert(items, { kind = "action", action = a.action, label = a.label })
+        end
+        add_row(items, self.action_buttons_info, button_size * 2)
+    end
+    if self.colors then
+        local items = {}
+        for _, color_info in ipairs(self.colors) do
+            table.insert(items, { kind = "color", name = color_info.name, color_value = color_info.color })
+        end
+        add_row(items, self.color_buttons_info, button_size)
+    end
+    if self.widths then
+        local items = {}
+        for _, width_info in ipairs(self.widths) do
+            table.insert(items, { kind = "width", name = width_info.name, width_value = width_info.width })
+        end
+        add_row(items, self.width_buttons_info, button_size)
+    end
 
-    local content
-    if has_colors and has_widths then
-        content = VerticalGroup:new{
-            align = "center",
-            CenterContainer:new{
-                dimen = Geom:new{ w = inner_w, h = button_size },
-                color_row_group,
-            },
-            VerticalSpan:new{ width = row_gap },
-            CenterContainer:new{
-                dimen = Geom:new{ w = inner_w, h = button_size },
-                width_row_group,
-            },
-        }
-    elseif has_colors then
-        content = CenterContainer:new{
+    local inner_w = 0
+    for _, row in ipairs(self.rows) do inner_w = math.max(inner_w, row.width) end
+    self.width = inner_w
+    self.height = #self.rows * button_size + math.max(0, #self.rows - 1) * row_gap
+
+    local content = VerticalGroup:new{ align = "center" }
+    for i, row in ipairs(self.rows) do
+        if i > 1 then
+            table.insert(content, VerticalSpan:new{ width = row_gap })
+        end
+        table.insert(content, CenterContainer:new{
             dimen = Geom:new{ w = inner_w, h = button_size },
-            color_row_group,
-        }
-    else
-        -- widths-only picker (color picker experimental flag off)
-        content = CenterContainer:new{
-            dimen = Geom:new{ w = inner_w, h = button_size },
-            width_row_group,
-        }
+            row.group,
+        })
     end
 
     self.frame = FrameContainer:new{
@@ -2461,23 +2504,28 @@ function ColorPickerWidget:init()
     }
 end
 
+-- Top y (absolute) of row `i`, given the widget's top y.
+function ColorPickerWidget:_rowY(top_y, i)
+    return top_y + Size.border.window + self._padding + (i - 1) * (self._button_size + self._row_gap)
+end
+
 -- Hit-test one row of buttons. `row_y` is the top y of the row in absolute
 -- coordinates. Returns the matching button info or nil.
-function ColorPickerWidget:_hitRow(x, y, row_y, info_list)
-    local button_size = self._button_size
+function ColorPickerWidget:_hitRow(x, y, row_y, row)
+    local info_list = row.info
+    local button_w = row.button_w
     local spacing = self._spacing
     if #info_list == 0 then return nil end
-    if y < row_y or y >= row_y + button_size then return nil end
+    if y < row_y or y >= row_y + self._button_size then return nil end
 
-    local row_buttons_width = #info_list * button_size + (#info_list - 1) * spacing
-    local row_start_x = self.dimen.x + (self.dimen.w - row_buttons_width) / 2
+    local row_start_x = self.dimen.x + (self.dimen.w - row.width) / 2
     local relative_x = x - row_start_x
-    if relative_x < 0 or relative_x >= row_buttons_width then return nil end
+    if relative_x < 0 or relative_x >= row.width then return nil end
 
-    local stride = button_size + spacing
+    local stride = button_w + spacing
     local idx = math.floor(relative_x / stride) + 1
     local pos_in_slot = relative_x - (idx - 1) * stride
-    if pos_in_slot >= button_size then return nil end
+    if pos_in_slot >= button_w then return nil end
     if idx < 1 or idx > #info_list then return nil end
     return info_list[idx]
 end
@@ -2501,29 +2549,12 @@ function ColorPickerWidget:handlePenTap(x, y)
         return true  -- Consume the event to prevent drawing
     end
 
-    local border = Size.border.window
-    local button_size = self._button_size
-    local row_gap = self._row_gap
-    local padding = self._padding
-
-    -- When colors are hidden (color-picker flag off, width-picker on),
-    -- the widths row slides up to the top-row position. The info-lists
-    -- drive which row is where.
-    local top_row_y = self.dimen.y + border + padding
-    local colors_present = #self.color_buttons_info > 0
-    local widths_row_y = colors_present and (top_row_y + button_size + row_gap) or top_row_y
-
-    local btn = self:_hitRow(x, y, top_row_y, self.color_buttons_info)
-        or self:_hitRow(x, y, widths_row_y, self.width_buttons_info)
-
-    if btn then
-        if self.callback then
-            self.callback(btn.color_value, btn.color_name, btn.width_value)
+    for i, row in ipairs(self.rows) do
+        local btn = self:_hitRow(x, y, self:_rowY(self.dimen.y, i), row)
+        if btn then
+            self:_activate(btn)
+            return true
         end
-        if self.close_callback then
-            self.close_callback()
-        end
-        return true
     end
 
     -- Inside picker but didn't hit a button - still consume the event
@@ -2538,29 +2569,15 @@ function ColorPickerWidget:onTapCloseOutside(_, ges)
         local inside = x >= self.dimen.x and x < self.dimen.x + self.dimen.w
                 and y >= self.dimen.y and y < self.dimen.y + self.dimen.h
         if inside then
-            -- Tap is inside, let the color buttons handle it
+            -- Tap is inside, let the buttons handle it
             return false
         end
     end
-    -- Tap is outside, close the widget without changing color
+    -- Tap is outside, close the widget without changing anything
     if self.close_callback then
         self.close_callback()
     end
     return true
-end
-
--- Update button dimens for one row so individual TapSelectColor gesture ranges
--- match the painted positions. Mirrors the centered layout built in init().
-function ColorPickerWidget:_placeRow(info_list, paint_x, frame_inner_width, padding, border, row_y)
-    if #info_list == 0 then return end
-    local button_size = self._button_size
-    local spacing = self._spacing
-    local total_buttons_width = #info_list * button_size + (#info_list - 1) * spacing
-    local row_start_x = paint_x + border + padding + (frame_inner_width - total_buttons_width) / 2
-    for i, btn in ipairs(info_list) do
-        btn.dimen.x = row_start_x + (i - 1) * (button_size + spacing)
-        btn.dimen.y = row_y
-    end
 end
 
 function ColorPickerWidget:paintTo(bb, x, y)
@@ -2571,26 +2588,15 @@ function ColorPickerWidget:paintTo(bb, x, y)
     -- Paint the frame at the absolute position
     self.frame:paintTo(bb, paint_x, paint_y)
 
-    if not self.color_buttons_info then return end
-
-    local button_size = self._button_size
-    local row_gap = self._row_gap
-    local padding = self._padding
-    local border = Size.border.window
-    local frame_inner_width = self.dimen.w - 2 * padding - 2 * border
-
-    -- Symmetric with handlePenTap: widths slide up to the top slot when
-    -- no colors are visible.
-    local top_row_y = paint_y + border + padding
-    local colors_present = #self.color_buttons_info > 0
-
-    if colors_present then
-        self:_placeRow(self.color_buttons_info, paint_x, frame_inner_width, padding, border, top_row_y)
-    end
-
-    if self.width_buttons_info and #self.width_buttons_info > 0 then
-        local widths_row_y = colors_present and (top_row_y + button_size + row_gap) or top_row_y
-        self:_placeRow(self.width_buttons_info, paint_x, frame_inner_width, padding, border, widths_row_y)
+    -- Update button dimens so their TapSelectColor ranges match what's
+    -- painted. Mirrors the centered layout built in init().
+    for i, row in ipairs(self.rows or {}) do
+        local row_y = self:_rowY(paint_y, i)
+        local row_start_x = paint_x + (self.dimen.w - row.width) / 2
+        for j, btn in ipairs(row.info) do
+            btn.dimen.x = row_start_x + (j - 1) * (row.button_w + self._spacing)
+            btn.dimen.y = row_y
+        end
     end
 end
 
@@ -2598,12 +2604,14 @@ function ColorPickerWidget:onCloseWidget()
     UIManager:setDirty(nil, "ui", self.dimen)
 end
 
--- Show color picker popup near the pen position
+-- Show the hold-pen menu near the pen position: tool actions (undo, redo,
+-- lasso, note) and, when their experimental options are on, colors and
+-- pen widths.
 function Pencil:showColorPicker(x, y)
     if self.color_picker_showing then return end
 
     -- Discard any current stroke that was made while holding still
-    -- The user was holding still to trigger color picker, not intentionally drawing
+    -- The user was holding still to trigger the menu, not intentionally drawing
     if self.current_stroke then
         self.current_stroke = nil
         -- Repaint to remove the stroke from screen immediately
@@ -2615,68 +2623,28 @@ function Pencil:showColorPicker(x, y)
     self.color_picker_showing = true
 
     local plugin = self
-
-    -- Which rows to render is driven by the two experimental toggles,
-    -- independently. The hold-pen-still gesture only gets here when at
-    -- least one of them is on (see checkColorPickerTrigger), so at least
-    -- one row is guaranteed non-empty.
-    local show_colors = self.experimental_color_picker
-    local show_widths = self.experimental_pen_width
-    local colors_for_picker = show_colors and self.available_colors or nil
-    local widths_for_picker = show_widths and self.available_widths or nil
-
-    -- Picker uses up to two rows (colors on top, widths below). Row width
-    -- is the wider of the two visible rows; height accumulates one
-    -- button_size per visible row plus a gap between them.
-    local button_size = Screen:scaleBySize(36)
-    local spacing = Screen:scaleBySize(8)
-    local row_gap = Screen:scaleBySize(8)
-    local padding = Screen:scaleBySize(10)
-    local border = Size.border.window
-    local colors_row_width = show_colors and
-        (#self.available_colors * button_size + (#self.available_colors - 1) * spacing) or 0
-    local widths_row_width = show_widths and
-        (#self.available_widths * button_size + (#self.available_widths - 1) * spacing) or 0
-    local buttons_width = math.max(colors_row_width, widths_row_width)
-    local picker_width = buttons_width + padding * 2 + border * 2
-    local rows = (show_colors and 1 or 0) + (show_widths and 1 or 0)
-    local picker_height = rows * button_size + padding * 2 + border * 2
-    if rows > 1 then
-        picker_height = picker_height + row_gap
-    end
-    local margin_above = Screen:scaleBySize(30)  -- Gap between picker and pen
-    local screen_margin = 10  -- Minimum margin from screen edges
-
-    -- Try to position above the pen first, centered horizontally
-    local picker_x = x - picker_width / 2
-    local picker_y = y - picker_height - margin_above
-
-    -- Adjust horizontal position to keep picker fully on screen
-    if picker_x < screen_margin then
-        picker_x = screen_margin
-    end
-    if picker_x + picker_width > Screen:getWidth() - screen_margin then
-        picker_x = Screen:getWidth() - picker_width - screen_margin
-    end
-
-    -- If no room above, position below the pen
-    if picker_y < screen_margin then
-        picker_y = y + margin_above
-    end
-
-    -- Final check: ensure it fits on screen vertically
-    if picker_y + picker_height > Screen:getHeight() - screen_margin then
-        picker_y = Screen:getHeight() - picker_height - screen_margin
+    local actions = nil
+    if self.hold_menu then
+        actions = {
+            { action = "undo", label = _("Undo") },
+            { action = "redo", label = _("Redo") },
+            { action = "lasso", label = _("Lasso") },
+            { action = "note", label = _("Note") },
+        }
     end
 
     local color_picker = ColorPickerWidget:new{
-        colors = colors_for_picker,
-        widths = widths_for_picker,
+        actions = actions,
+        colors = self.experimental_color_picker and self.available_colors or nil,
+        widths = self.experimental_pen_width and self.available_widths or nil,
         current_color_name = self.tool_settings[TOOL_PEN].color_name,
         current_width = self.tool_settings[TOOL_PEN].width,
-        callback = function(color_value, color_name, width_value)
+        callback = function(color_value, color_name, width_value, action)
+            if action then
+                plugin:runHoldMenuAction(action, x, y)
+                return
+            end
             -- Width taps are routed through width_value; color taps leave it nil.
-            -- This avoids the string-match ambiguity the earlier prototype had.
             if width_value then
                 plugin:setPenWidth(width_value)
                 UIManager:show(InfoMessage:new{
@@ -2699,6 +2667,7 @@ function Pencil:showColorPicker(x, y)
             })
         end,
         close_callback = function()
+            if not plugin.color_picker_showing then return end
             plugin.color_picker_showing = false
             UIManager:close(plugin.color_picker_widget)
             plugin.color_picker_widget = nil
@@ -2707,9 +2676,21 @@ function Pencil:showColorPicker(x, y)
         end,
     }
 
-    -- Position the widget at the calculated coordinates
-    -- Set dimen with absolute position before showing
-    color_picker.dimen = color_picker.dimen or Geom:new{}
+    -- Place it above the pen, centered, kept on screen; below the pen if
+    -- there's no room above.
+    local picker_width, picker_height = color_picker.dimen.w, color_picker.dimen.h
+    local margin_above = Screen:scaleBySize(30)  -- Gap between picker and pen
+    local screen_margin = 10  -- Minimum margin from screen edges
+    local picker_x = x - picker_width / 2
+    local picker_y = y - picker_height - margin_above
+    picker_x = math.max(screen_margin, math.min(picker_x, Screen:getWidth() - picker_width - screen_margin))
+    if picker_y < screen_margin then
+        picker_y = y + margin_above
+    end
+    if picker_y + picker_height > Screen:getHeight() - screen_margin then
+        picker_y = Screen:getHeight() - picker_height - screen_margin
+    end
+
     color_picker.dimen.x = picker_x
     color_picker.dimen.y = picker_y
 
@@ -2718,7 +2699,685 @@ function Pencil:showColorPicker(x, y)
     UIManager:show(self.color_picker_widget)
     UIManager:setDirty(self.color_picker_widget, "ui")
 
-    logger.dbg("Pencil: color picker shown at", picker_x, picker_y)
+    logger.dbg("Pencil: hold menu shown at", picker_x, picker_y)
+end
+
+-- Run a hold-menu action at the pen position (x, y).
+function Pencil:runHoldMenuAction(action, x, y)
+    if action == "undo" then
+        self:undoLastStroke()
+    elseif action == "redo" then
+        self:redoLastStroke()
+    elseif action == "lasso" then
+        self:startLasso()
+    elseif action == "note" then
+        self:openNoteAt(x, y)
+    end
+end
+
+-- Lasso: select strokes by circling them, then delete or drag them.
+-- Phases: "armed" (waiting for the pen), "drawing" (path being drawn),
+-- "selected" (buttons + selection box shown), "moving" (dragging).
+-- The selection box and buttons are painted on the page by paintTo and
+-- hit-tested here, so pen input keeps coming to the plugin (an overlay
+-- widget would route the pen to KOReader's gestures instead).
+
+local LASSO_MIN_RATIO = 0.6       -- Share of a stroke's points that must be inside
+local LASSO_BOX_MARGIN = 8        -- Padding around the selection box
+local LASSO_PREVIEW_MS = 120      -- Min interval between drag previews
+
+function Pencil:startLasso()
+    self.lasso = { phase = "armed" }
+end
+
+function Pencil:cancelLasso()
+    if not self.lasso then return end
+    self.lasso = nil
+    UIManager:setDirty(self.view, "ui")
+end
+
+-- Returns true while the lasso owns pen input.
+function Pencil:isLassoActive()
+    return self.lasso ~= nil
+end
+
+function Pencil:handleLassoSlot(slot)
+    local lasso = self.lasso
+    local raw_x = slot.x or self.pen_x or 0
+    local raw_y = slot.y or self.pen_y or 0
+    local x, y = self:transformCoordinates(raw_x, raw_y)
+    local down = slot.id ~= nil and slot.id >= 0
+
+    if lasso.phase == "armed" then
+        if down then
+            lasso.phase = "drawing"
+            lasso.path = { { x = x, y = y } }
+            self.pen_down = true
+            self.dirty_region = nil
+            self.stroke_fast_refresh = true
+            self.last_refresh_time = time.now()
+        end
+    elseif lasso.phase == "drawing" then
+        if down then
+            local last = lasso.path[#lasso.path]
+            if math.abs(x - last.x) + math.abs(y - last.y) >= 3 then
+                table.insert(lasso.path, { x = x, y = y })
+                self:drawLassoSegment(last.x, last.y, x, y)
+            end
+        else
+            self.pen_down = false
+            self:finishLassoPath()
+        end
+    elseif lasso.phase == "selected" then
+        if down and not self.pen_down then
+            self.pen_down = true
+            local hit = self:lassoHitTest(x, y)
+            if hit == "delete" then
+                self:deleteLassoSelection()
+            elseif hit == "done" then
+                self:cancelLasso()
+            elseif hit == "inside" then
+                lasso.phase = "moving"
+                lasso.from = { x = x, y = y }
+                lasso.dx, lasso.dy = 0, 0
+                lasso.preview_time = time.now()
+            else
+                self:cancelLasso()
+            end
+        elseif not down then
+            self.pen_down = false
+        end
+    elseif lasso.phase == "moving" then
+        if down then
+            lasso.dx, lasso.dy = x - lasso.from.x, y - lasso.from.y
+            local now = time.now()
+            if time.to_ms(now - lasso.preview_time) >= LASSO_PREVIEW_MS then
+                lasso.preview_time = now
+                self:repaintLasso(true)
+            end
+        else
+            self.pen_down = false
+            self:applyLassoMove()
+        end
+    end
+    return true
+end
+
+-- Draw a piece of the lasso path as a thin gray line, refreshed in batches.
+function Pencil:drawLassoSegment(x1, y1, x2, y2)
+    self:drawLineSegment(Screen.bb, x1, y1, x2, y2, 2, Blitbuffer.COLOR_DARK_GRAY)
+    local x0, y0 = math.min(x1, x2) - 3, math.min(y1, y2) - 3
+    local w, h = math.abs(x2 - x1) + 6, math.abs(y2 - y1) + 6
+    local r = self.dirty_region
+    if r then
+        local rx2, ry2 = math.max(r.x + r.w, x0 + w), math.max(r.y + r.h, y0 + h)
+        r.x, r.y = math.min(r.x, x0), math.min(r.y, y0)
+        r.w, r.h = rx2 - r.x, ry2 - r.y
+    else
+        self.dirty_region = { x = x0, y = y0, w = w, h = h }
+    end
+    local now = time.now()
+    if time.to_ms(now - self.last_refresh_time) >= self.refresh_interval_ms then
+        self.last_refresh_time = now
+        self:refreshDirtyRegion()
+    end
+end
+
+-- Strokes that can be selected: the ones drawn on screen right now.
+function Pencil:visibleStrokes()
+    local out = {}
+    local pages, page = self:getVisiblePages()
+    for _, p in ipairs(pages) do
+        for _, idx in ipairs(self.page_strokes[p] or {}) do
+            local stroke = self.strokes[idx]
+            if stroke then
+                if stroke.page_points then
+                    if self:syncStrokeToView(stroke) then table.insert(out, stroke) end
+                elseif p == page then
+                    table.insert(out, stroke)
+                end
+            end
+        end
+    end
+    return out
+end
+
+function Pencil:finishLassoPath()
+    local lasso = self.lasso
+    self.dirty_region = nil
+    local path = lasso.path
+    if not path or #path < 3 then
+        self:cancelLasso()
+        return
+    end
+    local selected, bbox = {}, nil
+    for _, stroke in ipairs(self:visibleStrokes()) do
+        if PencilGeometry.strokeInPolygon(stroke, path, LASSO_MIN_RATIO) then
+            table.insert(selected, stroke)
+            local b = PencilGeometry.computeStrokeBbox(stroke)
+            bbox = bbox and PencilGeometry.bboxUnion(bbox, b) or b
+        end
+    end
+    lasso.path = nil
+    if #selected == 0 then
+        self:cancelLasso()
+        return
+    end
+    lasso.strokes = selected
+    lasso.bbox = PencilGeometry.bboxExpand(bbox, LASSO_BOX_MARGIN)
+    lasso.phase = "selected"
+    self:repaintLasso(false)
+end
+
+-- Selection box (offset by the current drag) and button rects.
+function Pencil:lassoLayout()
+    local lasso = self.lasso
+    local b = lasso.bbox
+    local dx, dy = lasso.dx or 0, lasso.dy or 0
+    local box = { x = b.x0 + dx, y = b.y0 + dy, w = b.x1 - b.x0, h = b.y1 - b.y0 }
+    local bw, bh = Screen:scaleBySize(90), Screen:scaleBySize(40)
+    local gap = Screen:scaleBySize(8)
+    local by = box.y - bh - gap
+    if by < 0 then by = box.y + box.h + gap end
+    by = math.min(by, Screen:getHeight() - bh)
+    local bx = math.max(0, math.min(box.x, Screen:getWidth() - 2 * bw - gap))
+    return box, {
+        { name = "delete", label = _("Delete"), x = bx, y = by, w = bw, h = bh },
+        { name = "done", label = _("Done"), x = bx + bw + gap, y = by, w = bw, h = bh },
+    }
+end
+
+function Pencil:lassoHitTest(x, y)
+    local box, buttons = self:lassoLayout()
+    for _, b in ipairs(buttons) do
+        if x >= b.x and x < b.x + b.w and y >= b.y and y < b.y + b.h then
+            return b.name
+        end
+    end
+    if x >= box.x and x < box.x + box.w and y >= box.y and y < box.y + box.h then
+        return "inside"
+    end
+end
+
+-- Painted by paintTo while a selection exists.
+function Pencil:drawLassoOverlay(bb)
+    local box, buttons = self:lassoLayout()
+    bb:paintBorder(box.x, box.y, box.w, box.h, 2, Blitbuffer.COLOR_DARK_GRAY)
+    if self.lasso.phase == "moving" then return end
+    local face = Font:getFace("cfont", 18)
+    for _, b in ipairs(buttons) do
+        bb:paintRect(b.x, b.y, b.w, b.h, Blitbuffer.COLOR_WHITE)
+        bb:paintBorder(b.x, b.y, b.w, b.h, 2, Blitbuffer.COLOR_BLACK)
+        local label = TextWidget:new{ text = b.label, face = face, max_width = b.w - 4 }
+        local size = label:getSize()
+        label:paintTo(bb, b.x + math.floor((b.w - size.w) / 2), b.y + math.floor((b.h - size.h) / 2))
+        label:free()
+    end
+end
+
+function Pencil:repaintLasso(fast)
+    self.view:paintTo(Screen.bb, 0, 0)
+    self:paintTo(Screen.bb, 0, 0)
+    if fast then
+        Screen:refreshFast(0, 0, Screen:getWidth(), Screen:getHeight())
+    else
+        Screen:refreshUI(0, 0, Screen:getWidth(), Screen:getHeight())
+    end
+end
+
+function Pencil:deleteLassoSelection()
+    local selected = self.lasso.strokes
+    self.lasso = nil
+    if self:removeStrokes(selected) then
+        self:pushUndo({ type = "delete", strokes = selected })
+    end
+    self:afterHistoryChange()
+end
+
+function Pencil:applyLassoMove()
+    local lasso = self.lasso
+    local dx, dy = lasso.dx or 0, lasso.dy or 0
+    if math.abs(dx) + math.abs(dy) < 3 then
+        -- A tap inside the box: keep the selection.
+        lasso.phase = "selected"
+        lasso.dx, lasso.dy = 0, 0
+        self:repaintLasso(false)
+        return
+    end
+    self.lasso = nil
+    local pdeltas = self:translateStrokes(lasso.strokes, dx, dy)
+    self:pushUndo({ type = "move", strokes = lasso.strokes, dx = dx, dy = dy, pdeltas = pdeltas })
+    self:afterHistoryChange()
+end
+
+-- Shift strokes by (dx, dy) screen pixels; sign = -1 reverses a move.
+-- Page-anchored strokes move in page space by pdeltas[i] (computed from the
+-- view zoom on the first move and reused for undo/redo). Returns pdeltas.
+function Pencil:translateStrokes(strokes, dx, dy, pdeltas, sign)
+    sign = sign or 1
+    pdeltas = pdeltas or {}
+    for i, stroke in ipairs(strokes) do
+        local shifted = false
+        if stroke.page_points then
+            local d = pdeltas[i]
+            if not d then
+                local zoom = stroke._vz or self:pageAffine(stroke.page)
+                d = { x = zoom and dx / zoom or 0, y = zoom and dy / zoom or 0 }
+                pdeltas[i] = d
+            end
+            for _, q in ipairs(stroke.page_points) do
+                q.x = q.x + sign * d.x
+                q.y = q.y + sign * d.y
+            end
+            stroke._vz = nil
+            shifted = self:syncStrokeToView(stroke)
+        end
+        if not shifted then
+            for _, pt in ipairs(stroke.points) do
+                pt.x = pt.x + sign * dx
+                pt.y = pt.y + sign * dy
+            end
+        end
+    end
+    return pdeltas
+end
+
+-- Notes: a full-screen canvas for longer handwriting, anchored to a spot in
+-- the book and shown there as a small marker. Created from the hold-pen
+-- menu; reopened by tapping the marker with the pen.
+--
+-- note = {
+--     id, datetime, page, x, y,       -- anchor; x/y are screen coords at creation
+--     xpointer,                        -- EPUB: follows reflow
+--     page_x, page_y,                  -- PDF: page coordinates
+--     pages = { { strokes = { { points, width, color_name } } } },
+-- }
+
+local NOTE_MARKER_SIZE = 28
+local NOTE_MARKER_HIT_PAD = 12
+
+-- Screen position of a note's marker on the current view, or nil when the
+-- note isn't on a visible page.
+function Pencil:getNoteMarkerPos(note)
+    if self.ui.paging then
+        local zoom, ox, oy = self:pageAffine(note.page)
+        if not zoom or not note.page_x then return nil end
+        return note.page_x * zoom + ox, note.page_y * zoom + oy
+    end
+    if self:getGroupCurrentPage(note) ~= self:getCurrentPage() then return nil end
+    local y = note.y
+    if note.xpointer and self.ui.document and self.ui.document.getScreenPositionFromXPointer then
+        local ok, sy = pcall(self.ui.document.getScreenPositionFromXPointer, self.ui.document, note.xpointer)
+        if ok and sy then y = sy end
+    end
+    return note.x, y
+end
+
+function Pencil:getNoteMarkerRect(note)
+    local x, y = self:getNoteMarkerPos(note)
+    if not x then return nil end
+    local size = NOTE_MARKER_SIZE
+    local rx = math.max(0, math.min(math.floor(x - size / 2), Screen:getWidth() - size))
+    local ry = math.max(0, math.min(math.floor(y - size / 2), Screen:getHeight() - size))
+    return { x = rx, y = ry, w = size, h = size }
+end
+
+function Pencil:findNoteMarkerAt(x, y)
+    for _, note in ipairs(self.notes or {}) do
+        local r = self:getNoteMarkerRect(note)
+        if r and x >= r.x - NOTE_MARKER_HIT_PAD and x <= r.x + r.w + NOTE_MARKER_HIT_PAD
+                and y >= r.y - NOTE_MARKER_HIT_PAD and y <= r.y + r.h + NOTE_MARKER_HIT_PAD then
+            return note
+        end
+    end
+end
+
+-- A small "page with lines" icon.
+function Pencil:drawNoteMarkers(bb)
+    for _, note in ipairs(self.notes or {}) do
+        local r = self:getNoteMarkerRect(note)
+        if r then
+            bb:paintRect(r.x, r.y, r.w, r.h, Blitbuffer.COLOR_WHITE)
+            bb:paintBorder(r.x, r.y, r.w, r.h, 2, Blitbuffer.COLOR_BLACK)
+            local inset = math.floor(r.w / 5)
+            for i = 1, 3 do
+                bb:paintRect(r.x + inset, r.y + i * math.floor(r.h / 4), r.w - 2 * inset, 2, Blitbuffer.COLOR_BLACK)
+            end
+        end
+    end
+end
+
+-- Create a note anchored at screen position (x, y) and open it.
+function Pencil:openNoteAt(x, y)
+    local note = {
+        id = "note_" .. os.date("%Y%m%d%H%M%S") .. "_" .. tostring(#(self.notes or {}) + 1),
+        datetime = os.time(),
+        page = self:getCurrentPage(),
+        x = x,
+        y = y,
+        pages = { { strokes = {} } },
+    }
+    if self.ui.paging then
+        local pos = self.view:screenToPageTransform({ x = x, y = y })
+        if pos and pos.page then
+            note.page = pos.page
+            local zoom, ox, oy = self:pageAffine(pos.page)
+            if zoom then
+                note.page_x, note.page_y = (x - ox) / zoom, (y - oy) / zoom
+            end
+        end
+    elseif self.ui.rolling then
+        note.xpointer = self:getXPointerAtBboxCenter({ x0 = x, y0 = y, x1 = x, y1 = y })
+    end
+    self.notes = self.notes or {}
+    table.insert(self.notes, note)
+    self:openNote(note)
+end
+
+-- @param wait_lift ignore the pen contact that opened the note
+function Pencil:openNote(note, wait_lift)
+    if self.note_canvas then return end
+    -- The canvas takes over pen input, including the rest of this contact.
+    self.pen_down = false
+    self.current_stroke = nil
+    self.note_canvas = NoteCanvas:new{
+        plugin = self,
+        note = note,
+        wait_lift = wait_lift,
+    }
+    UIManager:show(self.note_canvas)
+    UIManager:setDirty(self.note_canvas, "ui")
+end
+
+local function noteHasInk(note)
+    for _, page in ipairs(note.pages or {}) do
+        if #page.strokes > 0 then return true end
+    end
+    return false
+end
+
+function Pencil:removeNote(note)
+    for i, n in ipairs(self.notes or {}) do
+        if n == note then
+            table.remove(self.notes, i)
+            return
+        end
+    end
+end
+
+-- Close the canvas; notes left empty are dropped.
+function Pencil:closeNoteCanvas(delete)
+    local canvas = self.note_canvas
+    if not canvas then return end
+    self.note_canvas = nil
+    UIManager:close(canvas)
+    if delete or not noteHasInk(canvas.note) then
+        self:removeNote(canvas.note)
+    end
+    self:saveStrokes()
+    UIManager:setDirty(self.view, "ui")
+end
+
+function Pencil:notesToSaveable()
+    local out = {}
+    for _, note in ipairs(self.notes or {}) do
+        local pages = {}
+        for i, page in ipairs(note.pages) do
+            local strokes = {}
+            for j, s in ipairs(page.strokes) do
+                strokes[j] = { p = PencilGeometry.packPoints(s.points), width = s.width, color_name = s.color_name }
+            end
+            pages[i] = { strokes = strokes }
+        end
+        table.insert(out, {
+            id = note.id, datetime = note.datetime, page = note.page,
+            x = note.x, y = note.y, xpointer = note.xpointer,
+            page_x = note.page_x, page_y = note.page_y,
+            pages = pages,
+        })
+    end
+    return out
+end
+
+function Pencil:notesFromSaved(saved)
+    local notes = {}
+    for _, n in ipairs(saved or {}) do
+        local pages = {}
+        for i, page in ipairs(n.pages or {}) do
+            local strokes = {}
+            for j, s in ipairs(page.strokes or {}) do
+                strokes[j] = { points = PencilGeometry.unpackPoints(s.p), width = s.width, color_name = s.color_name }
+            end
+            pages[i] = { strokes = strokes }
+        end
+        if #pages == 0 then pages[1] = { strokes = {} } end
+        table.insert(notes, {
+            id = n.id, datetime = n.datetime, page = n.page,
+            x = n.x, y = n.y, xpointer = n.xpointer,
+            page_x = n.page_x, page_y = n.page_y,
+            pages = pages,
+        })
+    end
+    return notes
+end
+
+-- Full-screen writing canvas for one note. Pen input is routed here by
+-- Pencil:handleStylusSlot while it's open; the top bar works with both pen
+-- and finger.
+NoteCanvas = InputContainer:extend{
+    plugin = nil,
+    note = nil,
+    wait_lift = false,
+    page_index = 1,
+}
+
+function NoteCanvas:init()
+    self.dimen = Geom:new{ x = 0, y = 0, w = Screen:getWidth(), h = Screen:getHeight() }
+    self.bar_h = Screen:scaleBySize(48)
+    self.page_index = 1
+    self.ges_events = {
+        TapBar = {
+            GestureRange:new{
+                ges = "tap",
+                range = function() return Geom:new{ x = 0, y = 0, w = Screen:getWidth(), h = self.bar_h } end,
+            },
+        },
+    }
+end
+
+function NoteCanvas:currentPage()
+    return self.note.pages[self.page_index]
+end
+
+function NoteCanvas:barButtons()
+    local labels = {
+        { name = "done", label = _("Done") },
+        { name = "undo", label = _("Undo") },
+        { name = "prev", label = _("Prev") },
+        { name = "page", label = T("%1/%2", self.page_index, #self.note.pages) },
+        { name = "next", label = _("Next") },
+        { name = "add", label = _("+ Page") },
+        { name = "delete", label = _("Delete") },
+    }
+    local w = math.floor(Screen:getWidth() / #labels)
+    for i, b in ipairs(labels) do
+        b.x, b.y, b.w, b.h = (i - 1) * w, 0, w, self.bar_h
+    end
+    return labels
+end
+
+function NoteCanvas:hitBar(x, y)
+    if y < 0 or y >= self.bar_h then return nil end
+    for _, b in ipairs(self:barButtons()) do
+        if x >= b.x and x < b.x + b.w then return b.name end
+    end
+end
+
+function NoteCanvas:runBarAction(name)
+    local plugin = self.plugin
+    if name == "done" then
+        plugin:closeNoteCanvas(false)
+        return
+    elseif name == "delete" then
+        plugin:closeNoteCanvas(true)
+        return
+    elseif name == "undo" then
+        table.remove(self:currentPage().strokes)
+    elseif name == "prev" then
+        self.page_index = math.max(1, self.page_index - 1)
+    elseif name == "next" then
+        self.page_index = math.min(#self.note.pages, self.page_index + 1)
+    elseif name == "add" then
+        table.insert(self.note.pages, self.page_index + 1, { strokes = {} })
+        self.page_index = self.page_index + 1
+    else
+        return
+    end
+    self:repaint()
+end
+
+function NoteCanvas:onTapBar(_, ges)
+    local name = ges and ges.pos and self:hitBar(ges.pos.x, ges.pos.y)
+    if name then self:runBarAction(name) end
+    return true
+end
+
+function NoteCanvas:strokeColor(stroke)
+    for _, c in ipairs(self.plugin.available_colors or {}) do
+        if c.name == stroke.color_name then return c.color end
+    end
+    return Blitbuffer.COLOR_BLACK
+end
+
+function NoteCanvas:renderStroke(bb, stroke)
+    local pts = stroke.points
+    local color = self:strokeColor(stroke)
+    if #pts == 1 then
+        local half = math.floor(stroke.width / 2)
+        bb:paintRectRGB32(pts[1].x - half, pts[1].y - half, stroke.width, stroke.width, color)
+        return
+    end
+    for i = 2, #pts do
+        self.plugin:drawLineSegment(bb, pts[i - 1].x, pts[i - 1].y, pts[i].x, pts[i].y, stroke.width, color)
+    end
+end
+
+function NoteCanvas:paintTo(bb, x, y)
+    local w, h = Screen:getWidth(), Screen:getHeight()
+    bb:paintRect(0, 0, w, h, Blitbuffer.COLOR_WHITE)
+    local face = Font:getFace("cfont", 18)
+    for _, b in ipairs(self:barButtons()) do
+        bb:paintBorder(b.x, b.y, b.w, b.h, 1, Blitbuffer.COLOR_DARK_GRAY)
+        local label = TextWidget:new{ text = b.label, face = face, max_width = b.w - 4 }
+        local size = label:getSize()
+        label:paintTo(bb, b.x + math.floor((b.w - size.w) / 2), b.y + math.floor((b.h - size.h) / 2))
+        label:free()
+    end
+    bb:paintRect(0, self.bar_h, w, 2, Blitbuffer.COLOR_BLACK)
+    for _, stroke in ipairs(self:currentPage().strokes) do
+        self:renderStroke(bb, stroke)
+    end
+end
+
+function NoteCanvas:repaint()
+    self:paintTo(Screen.bb, 0, 0)
+    Screen:refreshUI(0, 0, Screen:getWidth(), Screen:getHeight())
+end
+
+function NoteCanvas:isEraser(slot)
+    local plugin = self.plugin
+    if plugin.swap_eraser_and_highlighter then
+        return slot.tool == 3 or plugin.eraser_tool_active
+    end
+    return slot.tool == 2 or plugin.eraser_button_active or plugin.eraser_tool_active
+end
+
+function NoteCanvas:eraseAt(x, y)
+    local strokes = self:currentPage().strokes
+    local radius = self.plugin.tool_settings[TOOL_ERASER].width
+    local erased = false
+    for i = #strokes, 1, -1 do
+        if PencilGeometry.isPointNearStroke(x, y, strokes[i], radius) then
+            table.remove(strokes, i)
+            erased = true
+        end
+    end
+    if erased then self:repaint() end
+end
+
+-- Pen input while the canvas is open. Always consumes the event.
+function NoteCanvas:handleStylus(slot)
+    local plugin = self.plugin
+    local down = slot.id ~= nil and slot.id >= 0
+    if self.wait_lift then
+        if not down then self.wait_lift = false end
+        return true
+    end
+    local x, y = plugin:transformCoordinates(slot.x or self.last_x or 0, slot.y or self.last_y or 0)
+
+    if not down then
+        if self.stroke then
+            -- Show what was drawn since the last batched refresh.
+            plugin:refreshDirtyRegion()
+            self.stroke = nil
+        elseif self.contact and self.contact.bar then
+            local name = self:hitBar(self.contact.x, self.contact.y)
+            self.contact = nil
+            if name then self:runBarAction(name) end
+            return true
+        end
+        self.contact = nil
+        return true
+    end
+
+    if self:isEraser(slot) then
+        self.contact = self.contact or {}
+        self:eraseAt(x, y)
+        self.last_x, self.last_y = x, y
+        return true
+    end
+
+    if not self.contact then
+        -- New contact: the bar takes taps, the page takes ink.
+        self.contact = { x = x, y = y, bar = y < self.bar_h }
+        if self.contact.bar then return true end
+        local settings = plugin.tool_settings[TOOL_PEN]
+        self.stroke = { points = { { x = x, y = y } }, width = settings.width, color_name = settings.color_name }
+        table.insert(self:currentPage().strokes, self.stroke)
+        plugin.stroke_fast_refresh = true
+        plugin.dirty_region = nil
+        plugin.last_refresh_time = time.now()
+        self:drawLive(x, y, x, y)
+    elseif self.stroke and (x ~= self.last_x or y ~= self.last_y) then
+        table.insert(self.stroke.points, { x = x, y = y })
+        self:drawLive(self.last_x, self.last_y, x, y)
+    end
+    self.last_x, self.last_y = x, y
+    return true
+end
+
+-- Draw a segment straight to the framebuffer and refresh in batches,
+-- reusing the reader's low-latency path.
+function NoteCanvas:drawLive(x1, y1, x2, y2)
+    local plugin = self.plugin
+    local width = self.stroke.width
+    plugin:drawLineSegment(Screen.bb, x1, y1, x2, y2, width, self:strokeColor(self.stroke))
+    local pad = math.floor(width / 2) + 2
+    local x0, y0 = math.min(x1, x2) - pad, math.min(y1, y2) - pad
+    local w, h = math.abs(x2 - x1) + 2 * pad, math.abs(y2 - y1) + 2 * pad
+    local r = plugin.dirty_region
+    if r then
+        local rx2, ry2 = math.max(r.x + r.w, x0 + w), math.max(r.y + r.h, y0 + h)
+        r.x, r.y = math.min(r.x, x0), math.min(r.y, y0)
+        r.w, r.h = rx2 - r.x, ry2 - r.y
+    else
+        plugin.dirty_region = { x = x0, y = y0, w = w, h = h }
+    end
+    local now = time.now()
+    if time.to_ms(now - plugin.last_refresh_time) >= plugin.refresh_interval_ms then
+        plugin.last_refresh_time = now
+        plugin:refreshDirtyRegion()
+    end
 end
 
 -- Set pen color
@@ -4519,6 +5178,14 @@ function Pencil:paintTo(bb, x, y)
     if self.current_stroke and self.current_stroke.page == page then
         self:renderStroke(bb, self.current_stroke)
     end
+
+    if self.notes and #self.notes > 0 then
+        self:drawNoteMarkers(bb)
+    end
+
+    if self.lasso and self.lasso.strokes then
+        self:drawLassoOverlay(bb)
+    end
 end
 
 -- Get the pencil strokes file path for this document
@@ -4587,6 +5254,7 @@ end
 
 -- Load strokes from our own file
 function Pencil:loadStrokes()
+    self.notes = {}
     local filepath = self:migrateStrokesFileIfNeeded()
     logger.info("Pencil: loadStrokes - filepath =", filepath)
 
@@ -4616,6 +5284,7 @@ function Pencil:loadStrokes()
             self.strokes[i] = self:strokeFromSaved(saved)
         end
         self:rebuildPageIndex()
+        self.notes = self:notesFromSaved(data.notes)
 
         -- Load annotation groups or bootstrap from v1 data
         if data.annotation_groups and #data.annotation_groups > 0 then
@@ -4735,6 +5404,7 @@ function Pencil:saveStrokes()
         version = 4,
         strokes = saveable_strokes,
         annotation_groups = self.annotation_groups,
+        notes = self:notesToSaveable(),
     }
 
     local f, err = io.open(filepath, "w")
@@ -4839,6 +5509,7 @@ end
 
 -- Handle page changes (paging mode)
 function Pencil:onPageUpdate(pageno)
+    self.lasso = nil
     -- Clear any in-progress stroke when page changes
     if self.current_stroke and #self.current_stroke.points >= 2 then
         -- Save the stroke before clearing. The inline saveStrokes below covers
