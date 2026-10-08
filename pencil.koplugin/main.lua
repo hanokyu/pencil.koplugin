@@ -1937,24 +1937,30 @@ function Pencil:findStrokeIndex(stroke, hint)
     end
 end
 
--- Remove strokes by reference. Returns true if any was removed.
+-- Remove strokes by reference, keeping group stroke indices valid. Returns
+-- true if any was removed.
 function Pencil:removeStrokes(strokes)
-    local removed = false
+    local indices = {}
     for _, stroke in ipairs(strokes) do
         local idx = self:findStrokeIndex(stroke)
-        if idx then
-            table.remove(self.strokes, idx)
-            removed = true
-        end
+        if idx then table.insert(indices, idx) end
     end
-    return removed
+    table.sort(indices, function(a, b) return a > b end)
+    for _, idx in ipairs(indices) do
+        table.remove(self.strokes, idx)
+    end
+    if #indices > 0 then
+        self:shiftGroupStrokeIndices(indices)
+    end
+    return #indices > 0
 end
 
 function Pencil:afterHistoryChange()
     self:rebuildPageIndex()
-    self:rebuildAnnotationGroups()
-    self:saveStrokes()
-    UIManager:setDirty(self.view, "ui")
+    -- Group rebuild and save are slow; run them once the pen rests.
+    self.groups_stale = true
+    self:scheduleDeferredWork()
+    self:repaintReader()
 end
 
 -- Undo (undoing = true) or redo an action. Returns the action to push on
@@ -2201,6 +2207,7 @@ function Pencil:scheduleDeferredWork()
             return
         end
         self.pending_save = nil
+        self:rebuildStaleGroups()
         self:flushDirtyGroups()
         self:saveStrokes()
     end
@@ -2215,13 +2222,31 @@ function Pencil:cancelPendingSave()
     end
 end
 
+-- Rebuild annotation groups if a cheap in-place update (erase, undo/redo,
+-- lasso) left them stale. Rebuilding re-creates every group bookmark in the
+-- book, so it's batched here instead of run per action.
+function Pencil:rebuildStaleGroups()
+    if self.groups_stale then
+        self.groups_stale = false
+        self:rebuildAnnotationGroups()
+    end
+end
+
+-- Repaint the page with our strokes. ReaderView is not a window, so marking
+-- it dirty only refreshes the old pixels; ReaderUI (its dialog) is.
+function Pencil:repaintReader()
+    UIManager:setDirty(self.ui and (self.ui.dialog or self.ui) or self.view, "ui")
+end
+
 -- Run any pending deferred work immediately. Called before close, page change,
 -- or any path that must persist state synchronously.
 function Pencil:flushDeferredWork()
-    if not self.pending_save and not (self.dirty_groups and next(self.dirty_groups)) then
+    if not self.pending_save and not self.groups_stale
+            and not (self.dirty_groups and next(self.dirty_groups)) then
         return
     end
     self:cancelPendingSave()
+    self:rebuildStaleGroups()
     self:flushDirtyGroups()
     self:saveStrokes()
 end
@@ -2772,16 +2797,27 @@ end
 
 local LASSO_MIN_RATIO = 0.6       -- Share of a stroke's points that must be inside
 local LASSO_BOX_MARGIN = 8        -- Padding around the selection box
-local LASSO_PREVIEW_MS = 120      -- Min interval between drag previews
+local LASSO_PREVIEW_MS = 40       -- Min interval between drag previews
 
 function Pencil:startLasso()
     self.lasso = { phase = "armed" }
 end
 
+-- Drop lasso state (and the drag snapshot) without repainting.
+function Pencil:clearLasso()
+    local lasso = self.lasso
+    if not lasso then return end
+    if lasso.snapshot then
+        lasso.snapshot:free()
+        lasso.snapshot = nil
+    end
+    self.lasso = nil
+end
+
 function Pencil:cancelLasso()
     if not self.lasso then return end
-    self.lasso = nil
-    UIManager:setDirty(self.view, "ui")
+    self:clearLasso()
+    self:repaintReader()
 end
 
 -- Returns true while the lasso owns pen input.
@@ -2829,6 +2865,9 @@ function Pencil:handleLassoSlot(slot)
                 lasso.from = { x = x, y = y }
                 lasso.dx, lasso.dy = 0, 0
                 lasso.preview_time = time.now()
+                -- The page as shown now; the drag preview only moves an
+                -- outline over it, restoring pixels from this copy.
+                lasso.snapshot = Screen.bb:copy()
             else
                 self:cancelLasso()
             end
@@ -2841,7 +2880,7 @@ function Pencil:handleLassoSlot(slot)
             local now = time.now()
             if time.to_ms(now - lasso.preview_time) >= LASSO_PREVIEW_MS then
                 lasso.preview_time = now
-                self:repaintLasso(true)
+                self:previewLassoDrag()
             end
         else
             self.pen_down = false
@@ -2973,9 +3012,48 @@ function Pencil:repaintLasso(fast)
     end
 end
 
+-- Move the selection outline to the current drag offset: restore the old
+-- outline's pixels from the snapshot, draw the new one, refresh just that.
+function Pencil:previewLassoDrag()
+    local lasso = self.lasso
+    local snap = lasso.snapshot
+    if not snap then return end
+    local box = self:lassoLayout()
+    local bb = Screen.bb
+    local sw, sh = Screen:getWidth(), Screen:getHeight()
+    local function clamp(r)
+        local x0, y0 = math.max(0, r.x), math.max(0, r.y)
+        local x1, y1 = math.min(sw, r.x + r.w), math.min(sh, r.y + r.h)
+        if x1 <= x0 or y1 <= y0 then return nil end
+        return { x = x0, y = y0, w = x1 - x0, h = y1 - y0 }
+    end
+    local function restore(r)
+        local c = clamp(r)
+        if c then bb:blitFrom(snap, c.x, c.y, c.x, c.y, c.w, c.h) end
+    end
+    local prev = lasso.prev_box
+    if prev then
+        local t = 2
+        restore({ x = prev.x, y = prev.y, w = prev.w, h = t })
+        restore({ x = prev.x, y = prev.y + prev.h - t, w = prev.w, h = t })
+        restore({ x = prev.x, y = prev.y, w = t, h = prev.h })
+        restore({ x = prev.x + prev.w - t, y = prev.y, w = t, h = prev.h })
+    end
+    local c = clamp(box)
+    if c then bb:paintBorder(c.x, c.y, c.w, c.h, 2, Blitbuffer.COLOR_DARK_GRAY) end
+    local area = prev and {
+        x = math.min(prev.x, box.x), y = math.min(prev.y, box.y),
+        w = math.max(prev.x + prev.w, box.x + box.w) - math.min(prev.x, box.x),
+        h = math.max(prev.y + prev.h, box.y + box.h) - math.min(prev.y, box.y),
+    } or box
+    area = clamp(area)
+    if area then Screen:refreshFast(area.x, area.y, area.w, area.h) end
+    lasso.prev_box = box
+end
+
 function Pencil:deleteLassoSelection()
     local selected = self.lasso.strokes
-    self.lasso = nil
+    self:clearLasso()
     if self:removeStrokes(selected) then
         self:pushUndo({ type = "delete", strokes = selected })
     end
@@ -2985,6 +3063,11 @@ end
 function Pencil:applyLassoMove()
     local lasso = self.lasso
     local dx, dy = lasso.dx or 0, lasso.dy or 0
+    if lasso.snapshot then
+        lasso.snapshot:free()
+        lasso.snapshot = nil
+    end
+    lasso.prev_box = nil
     if math.abs(dx) + math.abs(dy) < 3 then
         -- A tap inside the box: keep the selection.
         lasso.phase = "selected"
@@ -2992,7 +3075,7 @@ function Pencil:applyLassoMove()
         self:repaintLasso(false)
         return
     end
-    self.lasso = nil
+    self:clearLasso()
     local pdeltas = self:translateStrokes(lasso.strokes, dx, dy)
     self:pushUndo({ type = "move", strokes = lasso.strokes, dx = dx, dy = dy, pdeltas = pdeltas })
     self:afterHistoryChange()
@@ -3163,7 +3246,7 @@ function Pencil:closeNoteCanvas(delete)
         self:removeNote(canvas.note)
     end
     self:saveStrokes()
-    UIManager:setDirty(self.view, "ui")
+    self:repaintReader()
 end
 
 function Pencil:notesToSaveable()
@@ -4849,7 +4932,7 @@ function Pencil:clearPageStrokes()
         text = T(_("Cleared %1 annotation(s) from page."), #deleted_strokes),
         timeout = 1,
     })
-    UIManager:setDirty(self.view, "ui")
+    self:repaintReader()
 end
 
 -- Clear all strokes
@@ -4867,7 +4950,7 @@ function Pencil:clearAllStrokes()
     -- Belt-and-suspenders: any leftover files get reaped.
     self:purgeOrphanImages()
 
-    UIManager:setDirty(self.view, "ui")
+    self:repaintReader()
 end
 
 -- Render a line segment using rectangles (since BlitBuffer has no native line drawing)
@@ -4959,10 +5042,7 @@ end
 function Pencil:finishEraseGesture()
     self.eraser_contact = false
     self.highlight_box_cache = nil
-    if self.erase_groups_stale then
-        self.erase_groups_stale = false
-        self:rebuildAnnotationGroups()
-    end
+    self:rebuildStaleGroups()
 end
 
 -- Repaint after strokes were erased and refresh only the area they covered.
@@ -5057,7 +5137,7 @@ function Pencil:eraseAtPoint(x, y, page, defer_groups)
             -- far too slow to do per eraser sample. Keep group indices valid
             -- now and rebuild once in finishEraseGesture.
             self:shiftGroupStrokeIndices(indices_to_remove)
-            self.erase_groups_stale = true
+            self.groups_stale = true
         else
             self:rebuildAnnotationGroups()
         end
@@ -5486,6 +5566,11 @@ function Pencil:onCloseDocument()
     end
 
     self:teardownPenInput()
+    if self.note_canvas then
+        self:closeNoteCanvas(false)
+    end
+    self:clearLasso()
+    self:rebuildStaleGroups()
 
     -- Run any pending deferred image captures synchronously before close so
     -- we don't lose a fresh annotation. Must happen before the final save so
@@ -5557,7 +5642,7 @@ end
 
 -- Handle page changes (paging mode)
 function Pencil:onPageUpdate(pageno)
-    self.lasso = nil
+    self:clearLasso()
     -- Clear any in-progress stroke when page changes
     if self.current_stroke and #self.current_stroke.points >= 2 then
         -- Save the stroke before clearing. The inline saveStrokes below covers
