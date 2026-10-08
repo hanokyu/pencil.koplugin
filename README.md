@@ -1,14 +1,41 @@
-# pencil.koplugin
+# pencil.koplugin (Kobo Elipsa 2E fork)
+
+This is a personal fork of [mysticknits/pencil.koplugin](https://github.com/mysticknits/pencil.koplugin), used to test the plugin on my own **Kobo Elipsa 2E** with the **Kobo Stylus 2**.
+
+All changes in this fork were vibe-coded with [Claude](https://claude.com/claude-code): I describe what I see on the device, Claude reads the code, writes the fix and tests, and I try it on the Elipsa 2E. Expect rough edges. It is only tested on that one device, so for other Kobo models use the [original plugin](https://github.com/mysticknits/pencil.koplugin) instead.
+
+All credit for the plugin itself goes to **[mysticknits](https://github.com/mysticknits)** and the contributors listed in [Credits](#credits).
+
+### What's different from upstream
+
+- Holding the side button to highlight text no longer switches the tool to the eraser or shows a "Tool: eraser" message.
+- Quick dots (`...`, the dots on i and j) are no longer dropped, and strokes start exactly where the pen lands.
+- The end of a stroke shows up as soon as the pen lifts, instead of appearing late.
+- Lower writing latency: fast refresh for dark ink, and a save debounce that actually works.
+- The eraser end keeps up with the pen, even in books with many strokes and highlights.
+- Pulled in from open upstream pull requests: no crash from pencil bookmarks at invalid positions ([#89](https://github.com/mysticknits/pencil.koplugin/pull/89)), strokes follow a renamed book ([#86](https://github.com/mysticknits/pencil.koplugin/pull/86)), and a smaller, faster save format ([#77](https://github.com/mysticknits/pencil.koplugin/pull/77)).
+
+Back up your books' `.sdr` folders before switching to this fork. Strokes saved by it can't be read by older versions of the plugin.
+
+### Install with Storefront
+
+With [Storefront](https://github.com/ultimatejimmy/storefront.koplugin): refresh the catalog, search for **pencil**, open **hanokyu/pencil.koplugin** and choose **Install from branch… → main**. Storefront then shows an update whenever `main` changes. Don't apply an update to the upstream pencil entry, as it would replace this fork.
+
+You still need the patched `input.lua` from this repo (see [Instructions for Installation](#instructions-for-installation)).
 
 ## Information
 
-This has been tested on:
+The upstream plugin has been tested on:
 
 - Kobo Libra Colour/Kobo Stylus 2/Epub format
 
-**This will currently only work on Kobo devices! I will attempt to add other device support by request and at a later date**
+This fork is tested on:
 
-If you resize your book while reading it, your annotations will be WONKY. This is something I will eventually address but for now, get your book set before you start writing.
+- Kobo Elipsa 2E/Kobo Stylus 2/Epub format
+
+**This will currently only work on Kobo devices!**
+
+If you resize your book while reading it, your annotations will be WONKY. Get your book set before you start writing.
 
 ### Compatible with Koreader - Snowflake
 
@@ -44,8 +71,8 @@ If you resize your book while reading it, your annotations will be WONKY. This i
 
 ## Questions or Issues with the Plugin
 
-If you have any questions or a feature request, please submit an issue in this repo.
-If you're experiencing issues with the plugin, please enable input debug mode in the Pencil menu, reproduce the issue, and include the debug log file in your issue report.
+This fork is a personal test build and does not take issue reports. If a problem also happens with the original plugin, please report it to [mysticknits/pencil.koplugin](https://github.com/mysticknits/pencil.koplugin/issues).
+If you're experiencing issues with the plugin, please enable input debug mode in the Pencil menu, reproduce the issue, and include the debug log file in your report.
 
 ## Experimental Features
 
@@ -85,8 +112,19 @@ When enabled, the plugin automatically groups your pencil strokes into logical a
 1. Export of annotations
 2. Handling changing canvas size
 
-## Acknowledgements
+## Credits
 
-Eraser end detection based on techniques from [eraser.koplugin](https://github.com/SimonLiu423/eraser.koplugin) by SimonLiu.
+- **[mysticknits](https://github.com/mysticknits)**: author of pencil.koplugin. Nearly everything in this fork is their work.
+- Contributors to the original plugin:
+  - [janoschp](https://github.com/janoschp): colorful strokes
+  - [Euphoriyy](https://github.com/Euphoriyy): night mode colors
+  - [CharlieQLe](https://github.com/CharlieQLe): side button detection
+  - [AndyHazz](https://github.com/AndyHazz): stylus input with invisible overlays
+- Authors of the upstream pull requests merged into this fork:
+  - [andrew-lawlor](https://github.com/andrew-lawlor): bookmarks at invalid positions ([#89](https://github.com/mysticknits/pencil.koplugin/pull/89))
+  - [bateast](https://github.com/bateast): strokes follow a renamed file ([#86](https://github.com/mysticknits/pencil.koplugin/pull/86))
+  - laurenamy: v4 save format (from [#77](https://github.com/mysticknits/pencil.koplugin/pull/77))
+- Eraser end detection is based on techniques from [eraser.koplugin](https://github.com/SimonLiu423/eraser.koplugin) by SimonLiu.
+- Fork changes written with [Claude Code](https://claude.com/claude-code).
 
-xoxo
+Licensed under the same license as the original plugin (see [LICENSE](LICENSE)).
