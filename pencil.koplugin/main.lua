@@ -541,6 +541,12 @@ function Pencil:handleStylusSlot(input, slot)
             local raw_x = slot.x or 0
             local raw_y = slot.y or 0
             local x, y = self:transformCoordinates(raw_x, raw_y)
+            -- Record the touch-down point itself, so a tap with no movement
+            -- (a dot) still produces a stroke and strokes start where the pen
+            -- landed instead of at the first move.
+            if slot.x and slot.y then
+                self:addRawPoint(x, y)
+            end
             self.pen_x = x
             self.pen_y = y
             -- Only track picker state and schedule the 10Hz poll when the
@@ -726,23 +732,27 @@ function Pencil:addRawPoint(x, y)
     local now = time.now()
     if time.to_ms(now - self.last_refresh_time) >= self.refresh_interval_ms then
         self.last_refresh_time = now
-        if self.dirty_region then
-            local r = self.dirty_region
-            -- Clamp to screen bounds
-            local rx = math.max(0, math.floor(r.x))
-            local ry = math.max(0, math.floor(r.y))
-            local rw = math.min(Screen:getWidth() - rx, math.ceil(r.w))
-            local rh = math.min(Screen:getHeight() - ry, math.ceil(r.h))
-            if self.stroke_fast_refresh then
-                -- Fast monochrome waveform: lowest e-ink latency for dark ink
-                Screen:refreshFast(rx, ry, rw, rh)
-            else
-                -- UI waveform: needed for proper shading of light/colored ink
-                Screen:refreshUI(rx, ry, rw, rh)
-            end
-            self.dirty_region = nil
-        end
+        self:refreshDirtyRegion()
     end
+end
+
+-- Refresh the screen area drawn since the last refresh, if any.
+function Pencil:refreshDirtyRegion()
+    local r = self.dirty_region
+    if not r then return end
+    -- Clamp to screen bounds
+    local rx = math.max(0, math.floor(r.x))
+    local ry = math.max(0, math.floor(r.y))
+    local rw = math.min(Screen:getWidth() - rx, math.ceil(r.w))
+    local rh = math.min(Screen:getHeight() - ry, math.ceil(r.h))
+    if self.stroke_fast_refresh then
+        -- Fast monochrome waveform: lowest e-ink latency for dark ink
+        Screen:refreshFast(rx, ry, rw, rh)
+    else
+        -- UI waveform: needed for proper shading of light/colored ink
+        Screen:refreshUI(rx, ry, rw, rh)
+    end
+    self.dirty_region = nil
 end
 
 -- End stroke from raw input
@@ -768,6 +778,9 @@ function Pencil:endRawStroke()
             self:writeDebugLog("endRawStroke: NOT SAVED (no current_stroke or no points)")
         end
     end
+    -- Show the tail drawn since the last periodic refresh now, rather than
+    -- letting it appear only with the delayed full refresh.
+    self:refreshDirtyRegion()
     self.current_stroke = nil
     -- Schedule delayed refresh for clean display after writing stops
     self:scheduleDelayedRefresh()
