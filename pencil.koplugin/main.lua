@@ -372,6 +372,7 @@ function Pencil:handleStylusSlot(input, slot)
     elseif ((self.swap_eraser_and_highlighter and not (slot.tool == TOOL_TYPE_HIGHLIGHTER)) or (not self.swap_eraser_and_highlighter and not (slot.tool == TOOL_TYPE_ERASER))) and self.eraser_button_active then
         -- Switched from eraser end to pen tip
         logger.info("Pencil: Pen tip detected via slot.tool, deactivating eraser mode")
+        self:finishEraseGesture()
         if self.eraser_button_deleted and #self.eraser_button_deleted > 0 then
             table.insert(self.undo_stack, { type = "delete", strokes = self.eraser_button_deleted })
             self:saveStrokes()
@@ -387,22 +388,29 @@ function Pencil:handleStylusSlot(input, slot)
             local raw_x = slot.x or self.pen_x
             local raw_y = slot.y or self.pen_y
             local x, y = self:transformCoordinates(raw_x, raw_y)
-            local page = self:getCurrentPage()
-            local deleted = self:eraseAtPoint(x, y, page)
-            if deleted then
-                for _, stroke in ipairs(deleted) do
-                    table.insert(self.eraser_button_deleted, stroke)
+            -- The digitizer reports at a high rate; only erase when the
+            -- eraser actually moved.
+            if not self.eraser_contact or x ~= self.pen_x or y ~= self.pen_y then
+                self.eraser_contact = true
+                local page = self:getCurrentPage()
+                local deleted = self:eraseAtPoint(x, y, page, true)
+                if deleted then
+                    for _, stroke in ipairs(deleted) do
+                        table.insert(self.eraser_button_deleted, stroke)
+                    end
+                    self:refreshAfterErase(deleted, true)
                 end
-                self.view:paintTo(Screen.bb, 0, 0)
-                self:paintTo(Screen.bb, 0, 0)
-                Screen:refreshFast(0, 0, Screen:getWidth(), Screen:getHeight())
+                -- Also remove any native KOReader text highlight at this position.
+                -- removeItemByIndex emits AnnotationsModified and triggers its own
+                -- repaint, so we don't need to mirror the refresh above.
+                self:eraseHighlightAtScreenPos(x, y)
+                self.pen_x = x
+                self.pen_y = y
             end
-            -- Also remove any native KOReader text highlight at this position.
-            -- removeItemByIndex emits AnnotationsModified and triggers its own
-            -- repaint, so we don't need to mirror the refreshFast call above.
-            self:eraseHighlightAtScreenPos(x, y)
-            self.pen_x = x
-            self.pen_y = y
+        elseif self.eraser_contact then
+            -- Eraser lifted off the screen (button/end still active)
+            self:finishEraseGesture()
+            UIManager:setDirty(self.view, "ui")
         end
         return true
     end
@@ -481,15 +489,12 @@ function Pencil:handleStylusSlot(input, slot)
                     self:writeDebugLog(string.format("ERASE ATTEMPT at (%d, %d) page=%s erasing=%s",
                         x, y, tostring(page), tostring(self.erasing)))
                 end
-                local deleted = self:eraseAtPoint(x, y, page)
+                local deleted = self:eraseAtPoint(x, y, page, true)
                 if deleted then
                     for _, stroke in ipairs(deleted) do
                         table.insert(self.eraser_deleted, stroke)
                     end
-                    -- Immediately repaint view and our strokes overlay, then refresh
-                    self.view:paintTo(Screen.bb, 0, 0)
-                    self:paintTo(Screen.bb, 0, 0)
-                    Screen:refreshUI(0, 0, Screen:getWidth(), Screen:getHeight())
+                    self:refreshAfterErase(deleted, false)
                     if self.input_debug_mode then
                         self:writeDebugLog(string.format("ERASED %d strokes at (%d, %d)", #deleted, x, y))
                     end
@@ -502,6 +507,7 @@ function Pencil:handleStylusSlot(input, slot)
             if self.pen_down and self.erasing then
                 self.pen_down = false
                 self.erasing = false
+                self:finishEraseGesture()
                 if self.eraser_deleted and #self.eraser_deleted > 0 then
                     table.insert(self.undo_stack, { type = "delete", strokes = self.eraser_deleted })
                     self:saveStrokes()
@@ -935,31 +941,44 @@ function Pencil:findHighlightAtScreenPos(screen_x, screen_y)
         if not page_pos then return nil end
     end
 
-    for index, item in ipairs(self.ui.annotation.annotations) do
-        -- drawer is nil for page-bookmarks; only text highlights have it set.
-        if item.drawer and item.pos0 and item.pos1 then
-            local boxes
-            if is_paging then
-                if item.page == page_pos.page then
-                    local ok, got = pcall(self.ui.document.getPageBoxesFromPositions,
-                                          self.ui.document, page_pos.page, item.pos0, item.pos1)
+    -- Box lookups go through the document engine for every highlight in the
+    -- book, which is far too slow per eraser sample. Compute them once per
+    -- page and reuse until a highlight is removed or the gesture ends.
+    local cache_page = is_paging and page_pos.page or self:getCurrentPage()
+    local cache = self.highlight_box_cache
+    if not cache or cache.page ~= cache_page then
+        cache = { page = cache_page, entries = {} }
+        for index, item in ipairs(self.ui.annotation.annotations) do
+            -- drawer is nil for page-bookmarks; only text highlights have it set.
+            if item.drawer and item.pos0 and item.pos1 then
+                local boxes
+                if is_paging then
+                    if item.page == page_pos.page then
+                        local ok, got = pcall(self.ui.document.getPageBoxesFromPositions,
+                                              self.ui.document, page_pos.page, item.pos0, item.pos1)
+                        if ok then boxes = got end
+                    end
+                else
+                    -- Rolling mode (EPUB): work in screen coordinates directly.
+                    local ok, got = pcall(self.ui.document.getScreenBoxesFromPositions,
+                                          self.ui.document, item.pos0, item.pos1, true)
                     if ok then boxes = got end
                 end
-            else
-                -- Rolling mode (EPUB): work in screen coordinates directly.
-                local ok, got = pcall(self.ui.document.getScreenBoxesFromPositions,
-                                      self.ui.document, item.pos0, item.pos1, true)
-                if ok then boxes = got end
-            end
-            if boxes then
-                local px = is_paging and page_pos.x or screen_x
-                local py = is_paging and page_pos.y or screen_y
-                for _, box in ipairs(boxes) do
-                    if px >= box.x and px < box.x + box.w
-                            and py >= box.y and py < box.y + box.h then
-                        return index
-                    end
+                if boxes and #boxes > 0 then
+                    table.insert(cache.entries, { index = index, boxes = boxes })
                 end
+            end
+        end
+        self.highlight_box_cache = cache
+    end
+
+    local px = is_paging and page_pos.x or screen_x
+    local py = is_paging and page_pos.y or screen_y
+    for _, entry in ipairs(cache.entries) do
+        for _, box in ipairs(entry.boxes) do
+            if px >= box.x and px < box.x + box.w
+                    and py >= box.y and py < box.y + box.h then
+                return entry.index
             end
         end
     end
@@ -980,6 +999,8 @@ function Pencil:eraseHighlightAtScreenPos(screen_x, screen_y)
         return false
     end
     local ok = pcall(self.ui.bookmark.removeItemByIndex, self.ui.bookmark, index)
+    -- Annotation indices shift after a removal; recompute boxes next time.
+    self.highlight_box_cache = nil
     if ok then
         UIManager:setDirty(self.ui.dialog or self.ui.view, "ui")
     end
@@ -1510,6 +1531,7 @@ function Pencil:onKeyPress(key)
     -- BTN_TOOL_PEN - pen tip - deactivate eraser mode
     if key_str:match("BTN_TOOL_PEN") or key_str:match("ToolPen") then
         logger.info("Pencil: BTN_TOOL_PEN press - deactivating eraser mode")
+        self:finishEraseGesture()
         if self.eraser_button_active and self.eraser_button_deleted and #self.eraser_button_deleted > 0 then
             -- Save any pending eraser deletions before switching to pen
             table.insert(self.undo_stack, { type = "delete", strokes = self.eraser_button_deleted })
@@ -1543,6 +1565,7 @@ function Pencil:onKeyRelease(key)
     -- Hardware Eraser button released
     if key.key == "Eraser" and self.eraser_button_active then
         logger.info("Pencil: Eraser button RELEASED")
+        self:finishEraseGesture()
         self.eraser_button_active = false
         if self.eraser_button_deleted and #self.eraser_button_deleted > 0 then
             table.insert(self.undo_stack, { type = "delete", strokes = self.eraser_button_deleted })
@@ -1556,6 +1579,7 @@ function Pencil:onKeyRelease(key)
     -- BTN_TOOL_RUBBER released (eraser end moved away) - works regardless of pencil enabled state
     if key_str:match("BTN_TOOL_RUBBER") or key_str:match("ToolRubber") then
         logger.info("Pencil: BTN_TOOL_RUBBER release - deactivating eraser mode")
+        self:finishEraseGesture()
         if self.eraser_button_active and self.eraser_button_deleted and #self.eraser_button_deleted > 0 then
             table.insert(self.undo_stack, { type = "delete", strokes = self.eraser_button_deleted })
             self:saveStrokes()
@@ -3803,7 +3827,72 @@ end
 
 -- Erase strokes at a given point
 -- Returns array of deleted strokes (for undo), or nil if none
-function Pencil:eraseAtPoint(x, y, page)
+-- Drop removed strokes from each group's stroke_indices and renumber the
+-- rest to match self.strokes after table.remove.
+-- @param removed array of removed stroke indices (any order)
+function Pencil:shiftGroupStrokeIndices(removed)
+    local sorted = {}
+    for i, idx in ipairs(removed) do sorted[i] = idx end
+    table.sort(sorted)
+    local removed_set = {}
+    for _, idx in ipairs(sorted) do removed_set[idx] = true end
+    for _, group in ipairs(self.annotation_groups or {}) do
+        if group.stroke_indices then
+            local kept = {}
+            for _, idx in ipairs(group.stroke_indices) do
+                if not removed_set[idx] then
+                    local shift = 0
+                    for _, r in ipairs(sorted) do
+                        if r < idx then shift = shift + 1 else break end
+                    end
+                    table.insert(kept, idx - shift)
+                end
+            end
+            group.stroke_indices = kept
+        end
+    end
+end
+
+-- End of a stylus erase gesture: do the work deferred while erasing.
+-- Must run before saveStrokes so the saved groups match the strokes.
+function Pencil:finishEraseGesture()
+    self.eraser_contact = false
+    self.highlight_box_cache = nil
+    if self.erase_groups_stale then
+        self.erase_groups_stale = false
+        self:rebuildAnnotationGroups()
+    end
+end
+
+-- Repaint after strokes were erased and refresh only the area they covered.
+-- @param deleted array of erased strokes
+-- @param fast use the fast waveform instead of the UI one
+function Pencil:refreshAfterErase(deleted, fast)
+    self.view:paintTo(Screen.bb, 0, 0)
+    self:paintTo(Screen.bb, 0, 0)
+    local bbox, margin = nil, 0
+    for _, stroke in ipairs(deleted) do
+        local b = PencilGeometry.computeStrokeBbox(stroke)
+        if b then
+            bbox = bbox and PencilGeometry.bboxUnion(bbox, b) or b
+        end
+        margin = math.max(margin, stroke.width or 0)
+    end
+    local sw, sh = Screen:getWidth(), Screen:getHeight()
+    local x, y, w, h = 0, 0, sw, sh
+    if bbox then
+        bbox = PencilGeometry.bboxClampToScreen(PencilGeometry.bboxExpand(bbox, margin + 2), sw, sh)
+        x, y = math.floor(bbox.x0), math.floor(bbox.y0)
+        w, h = math.ceil(bbox.x1) - x, math.ceil(bbox.y1) - y
+    end
+    if fast then
+        Screen:refreshFast(x, y, w, h)
+    else
+        Screen:refreshUI(x, y, w, h)
+    end
+end
+
+function Pencil:eraseAtPoint(x, y, page, defer_groups)
     -- Only erase strokes on the current page
     if self.input_debug_mode then
         self:writeDebugLog(string.format("ERASE: searching %d strokes at (%d, %d)",
@@ -3857,7 +3946,15 @@ function Pencil:eraseAtPoint(x, y, page)
             table.remove(self.strokes, idx)
         end
         self:rebuildPageIndex()
-        self:rebuildAnnotationGroups()
+        if defer_groups then
+            -- Rebuilding groups re-creates every group bookmark in the book,
+            -- far too slow to do per eraser sample. Keep group indices valid
+            -- now and rebuild once in finishEraseGesture.
+            self:shiftGroupStrokeIndices(indices_to_remove)
+            self.erase_groups_stale = true
+        else
+            self:rebuildAnnotationGroups()
+        end
         if self.input_debug_mode then
             self:writeDebugLog(string.format("ERASE: deleted %d strokes", #deleted))
         end
