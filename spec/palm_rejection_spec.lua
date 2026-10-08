@@ -179,4 +179,37 @@ describe("palm rejection (real main.lua)", function()
             assert.is_not_true(p.eraser_button_active)
         end)
     end)
+
+    describe("stylus callback restore", function()
+        local function input_with(cb)
+            local input = { stylus_callback = cb }
+            function input:registerStylusCallback(fn) self.stylus_callback = fn end
+            return input
+        end
+
+        it("re-registers after another plugin unregistered it", function()
+            local p = new_pencil()
+            p.stylus_callback_registered = true
+            p._stylus_cb = function() end
+            p.isOverlayActive = function() return false end
+            local input = input_with(nil)
+            p:ensureStylusCallback(input)
+            assert.are.equal(p._stylus_cb, input.stylus_callback)
+        end)
+
+        it("leaves another plugin's callback alone while it is on top", function()
+            local p = new_pencil()
+            p.stylus_callback_registered = true
+            p._stylus_cb = function() end
+            p.isOverlayActive = function() return true end
+            local input = input_with(nil)
+            p:ensureStylusCallback(input)
+            assert.is_nil(input.stylus_callback)
+            local other = function() end
+            input.stylus_callback = other
+            p.isOverlayActive = function() return false end
+            p:ensureStylusCallback(input)
+            assert.are.equal(other, input.stylus_callback)
+        end)
+    end)
 end)

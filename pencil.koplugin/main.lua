@@ -356,9 +356,10 @@ function Pencil:setupStylusCallback()
     -- Register the stylus callback
     -- Callback receives: input (Input object), slot (table with slot, id, x, y, tool, timev)
     -- Return true to "dominate" (remove from gesture detection)
-    Input:registerStylusCallback(function(input, slot)
+    self._stylus_cb = function(input, slot)
         return plugin:handleStylusSlot(input, slot)
-    end)
+    end
+    Input:registerStylusCallback(self._stylus_cb)
 
     self.stylus_callback_registered = true
     logger.info("Pencil: stylus callback registered")
@@ -372,12 +373,26 @@ function Pencil:installPalmFilter(input)
     if _palm_filter_installed or not input.routeStylusEvents then return end
     local route = input.routeStylusEvents
     input.routeStylusEvents = function(inp, ...)
+        if _active_pencil then
+            _active_pencil:ensureStylusCallback(inp)
+        end
         route(inp, ...)
         if _active_pencil then
             _active_pencil:filterPalmSlots(inp)
         end
     end
     _palm_filter_installed = true
+end
+
+-- Other plugins (Ink Away, for one) register their own stylus callback while
+-- open and unregister it on close without restoring ours, which would leave
+-- the reader deaf to the pen. Put ours back once the reader is on top again.
+function Pencil:ensureStylusCallback(input)
+    if not (self.stylus_callback_registered and self._stylus_cb) then return end
+    if input.stylus_callback ~= nil or not input.registerStylusCallback then return end
+    if self:isOverlayActive() then return end
+    input:registerStylusCallback(self._stylus_cb)
+    logger.info("Pencil: stylus callback restored")
 end
 
 -- Is a slot routed to us as a stylus actually a palm? The pen tip always
