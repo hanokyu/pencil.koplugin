@@ -380,6 +380,28 @@ function Pencil:installPalmFilter(input)
     _palm_filter_installed = true
 end
 
+-- Is a slot routed to us as a stylus actually a palm? The pen tip always
+-- reports tool 1, so its slot is learned from that. Tool 2/3 is trusted only
+-- on the pen's slot, or while the Kobo eraser / side button latch is held
+-- (input.lua then rewrites the pen's tool 1 to 2/3). Approach adapted from
+-- Ink Away's Stylus.classify (EmirErtorer/ink-away.koplugin, MIT).
+function Pencil:isPalmSlot(input, slot)
+    local tool = slot.tool
+    if tool == 1 then
+        self.learned_pen_slot = slot.slot
+        return false
+    end
+    if tool ~= 2 and tool ~= 3 then return false end
+    if slot.slot == nil then return false end  -- can't tell without a slot number
+    if input then
+        if input.pen_slot ~= nil and slot.slot == input.pen_slot then return false end
+        if tool == 2 and input.kobo_eraser_active then return false end
+        if tool == 3 and input.kobo_highlighter_active then return false end
+    end
+    if self.learned_pen_slot ~= nil and slot.slot == self.learned_pen_slot then return false end
+    return true
+end
+
 -- Drop finger contacts that start while the pen is near or was just used.
 -- A dropped contact stays dropped until its lift (which is dropped too), and
 -- contacts that started before stay untouched, so the gesture detector never
@@ -447,6 +469,17 @@ end
 -- slot = {slot=N, id=N, x=N, y=N, tool=N, timev=timestamp}
 -- id >= 0 means contact active, id == -1 means contact lifted
 function Pencil:handleStylusSlot(input, slot)
+    -- A resting palm can reach us looking like the eraser: Linux reports a
+    -- rejected touch as MT_TOOL_PALM (2), the eraser's tool number, and
+    -- input.lua routes any tool 2/3 slot here. Swallow it so it neither
+    -- erases nor becomes a gesture.
+    if self:isPalmSlot(input, slot) then
+        if self.input_debug_mode then
+            self:writeDebugLog(string.format("PALM: stylus-looking slot=%s tool=%s id=%s x=%s y=%s swallowed",
+                tostring(slot.slot), tostring(slot.tool), tostring(slot.id), tostring(slot.x), tostring(slot.y)))
+        end
+        return true
+    end
     -- Remembered for palm rejection (see filterPalmSlots)
     self.last_stylus_time = time.now()
     if self.note_canvas then

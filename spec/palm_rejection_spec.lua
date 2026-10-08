@@ -144,4 +144,39 @@ describe("palm rejection (real main.lua)", function()
         input:routeStylusEvents()
         assert.are.equal(1, routed)
     end)
+
+    describe("stylus-looking palms (MT_TOOL_PALM = 2)", function()
+        local function slot(n, tool) return { slot = n, id = 7, x = 10, y = 10, tool = tool } end
+
+        it("treats a tool 2 slot on an unknown slot as a palm", function()
+            local p = new_pencil()
+            assert.is_true(p:isPalmSlot({ pen_slot = PEN_SLOT }, slot(1, 2)))
+        end)
+
+        it("trusts the slot learned from a pen tip frame", function()
+            local p = new_pencil()
+            assert.is_false(p:isPalmSlot({}, slot(6, 1)))
+            assert.is_false(p:isPalmSlot({}, slot(6, 2)))
+            assert.is_true(p:isPalmSlot({}, slot(0, 2)))
+        end)
+
+        it("trusts the input's pen slot and the Kobo button latches", function()
+            local p = new_pencil()
+            assert.is_false(p:isPalmSlot({ pen_slot = PEN_SLOT }, slot(PEN_SLOT, 2)))
+            assert.is_false(p:isPalmSlot({ kobo_eraser_active = true }, slot(1, 2)))
+            assert.is_false(p:isPalmSlot({ kobo_highlighter_active = true }, slot(1, 3)))
+            assert.is_true(p:isPalmSlot({ kobo_eraser_active = true }, slot(1, 3)))
+        end)
+
+        it("swallows a palm before it can erase", function()
+            local p = new_pencil()
+            local erased = false
+            p.eraseAtPoint = function() erased = true end
+            p.input_debug_mode = false
+            local handled = p:handleStylusSlot({ pen_slot = PEN_SLOT }, slot(1, 2))
+            assert.is_true(handled)
+            assert.is_false(erased)
+            assert.is_not_true(p.eraser_button_active)
+        end)
+    end)
 end)
