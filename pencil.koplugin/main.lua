@@ -160,6 +160,7 @@ function Pencil:init()
     self.annotation_groups = {}  -- Annotation groups for bookmark integration
     self.strokes_loaded = false  -- Set true after successful loadStrokes
     self.undo_stack = {}
+    self.redo_stack = {}
 
     -- Initialize highlighter color (yellow)
     self.tool_settings[TOOL_HIGHLIGHTER].color = Blitbuffer.Color8(0xDD)  -- Light gray for e-ink
@@ -251,6 +252,12 @@ function Pencil:init()
         event = "PencilUndo",
         title = _("Pencil: undo"),
         reader = true,
+    })
+    Dispatcher:registerAction("pencil_redo", {
+        category = "none",
+        event = "PencilRedo",
+        title = _("Pencil: redo"),
+        reader = true,
         separator = true,
     })
 
@@ -320,6 +327,11 @@ end
 
 function Pencil:onPencilUndo()
     self:undoLastStroke()
+    return true
+end
+
+function Pencil:onPencilRedo()
+    self:redoLastStroke()
     return true
 end
 
@@ -459,7 +471,7 @@ function Pencil:handleStylusSlot(input, slot)
         logger.info("Pencil: Pen tip detected via slot.tool, deactivating eraser mode")
         self:finishEraseGesture()
         if self.eraser_button_deleted and #self.eraser_button_deleted > 0 then
-            table.insert(self.undo_stack, { type = "delete", strokes = self.eraser_button_deleted })
+            self:pushUndo({ type = "delete", strokes = self.eraser_button_deleted })
             self:saveStrokes()
         end
         self.eraser_button_active = false
@@ -594,7 +606,7 @@ function Pencil:handleStylusSlot(input, slot)
                 self.erasing = false
                 self:finishEraseGesture()
                 if self.eraser_deleted and #self.eraser_deleted > 0 then
-                    table.insert(self.undo_stack, { type = "delete", strokes = self.eraser_deleted })
+                    self:pushUndo({ type = "delete", strokes = self.eraser_deleted })
                     self:saveStrokes()
                 end
                 self.eraser_deleted = nil
@@ -953,7 +965,7 @@ function Pencil:endRawStroke()
         self:anchorStrokeToPage(self.current_stroke)
         table.insert(self.strokes, self.current_stroke)
         self:indexStroke(#self.strokes, self.current_stroke.page)
-        table.insert(self.undo_stack, { type = "add", stroke_idx = #self.strokes })
+        self:pushUndo({ type = "add", stroke_idx = #self.strokes })
         self:assignStrokeToGroup(#self.strokes)
         self:scheduleDeferredWork()
         if self.input_debug_mode then
@@ -1387,6 +1399,15 @@ function Pencil:addToMainMenu(menu_items)
                 enabled_func = function()
                     return #self.undo_stack > 0
                 end,
+            },
+            {
+                text = _("Redo"),
+                callback = function()
+                    self:redoLastStroke()
+                end,
+                enabled_func = function()
+                    return self.redo_stack ~= nil and #self.redo_stack > 0
+                end,
                 separator = true,
             },
             {
@@ -1742,7 +1763,7 @@ function Pencil:onKeyPress(key)
         self:finishEraseGesture()
         if self.eraser_button_active and self.eraser_button_deleted and #self.eraser_button_deleted > 0 then
             -- Save any pending eraser deletions before switching to pen
-            table.insert(self.undo_stack, { type = "delete", strokes = self.eraser_button_deleted })
+            self:pushUndo({ type = "delete", strokes = self.eraser_button_deleted })
             self:saveStrokes()
         end
         self.eraser_button_active = false
@@ -1776,7 +1797,7 @@ function Pencil:onKeyRelease(key)
         self:finishEraseGesture()
         self.eraser_button_active = false
         if self.eraser_button_deleted and #self.eraser_button_deleted > 0 then
-            table.insert(self.undo_stack, { type = "delete", strokes = self.eraser_button_deleted })
+            self:pushUndo({ type = "delete", strokes = self.eraser_button_deleted })
             self:saveStrokes()
         end
         self.eraser_button_deleted = nil
@@ -1789,7 +1810,7 @@ function Pencil:onKeyRelease(key)
         logger.info("Pencil: BTN_TOOL_RUBBER release - deactivating eraser mode")
         self:finishEraseGesture()
         if self.eraser_button_active and self.eraser_button_deleted and #self.eraser_button_deleted > 0 then
-            table.insert(self.undo_stack, { type = "delete", strokes = self.eraser_button_deleted })
+            self:pushUndo({ type = "delete", strokes = self.eraser_button_deleted })
             self:saveStrokes()
         end
         self.eraser_button_active = false
@@ -1816,30 +1837,88 @@ function Pencil:onKeyRelease(key)
 end
 
 -- Undo last stroke
-function Pencil:undoLastStroke()
-    if #self.undo_stack == 0 then return end
+-- Record an undoable action. "add" actions keep a reference to the stroke
+-- so undo/redo still find it after other strokes were erased (indices shift).
+-- Any new action invalidates the redo history.
+function Pencil:pushUndo(action)
+    if action.type == "add" and not action.stroke and action.stroke_idx then
+        action.stroke = self.strokes[action.stroke_idx]
+    end
+    table.insert(self.undo_stack, action)
+    self.redo_stack = {}
+end
 
-    local last_action = table.remove(self.undo_stack)
-    if last_action.type == "add" then
-        -- Remove the stroke that was added
-        local stroke_idx = last_action.stroke_idx
-        if stroke_idx and self.strokes[stroke_idx] then
-            table.remove(self.strokes, stroke_idx)
-            self:rebuildPageIndex()
-            self:rebuildAnnotationGroups()
-            self:saveStrokes()
-            UIManager:setDirty(self.view, "ui")
+-- Index of a stroke in self.strokes, trying the remembered index first.
+function Pencil:findStrokeIndex(stroke, hint)
+    if hint and self.strokes[hint] == stroke then return hint end
+    for i, s in ipairs(self.strokes) do
+        if s == stroke then return i end
+    end
+end
+
+-- Remove strokes by reference. Returns true if any was removed.
+function Pencil:removeStrokes(strokes)
+    local removed = false
+    for _, stroke in ipairs(strokes) do
+        local idx = self:findStrokeIndex(stroke)
+        if idx then
+            table.remove(self.strokes, idx)
+            removed = true
         end
-    elseif last_action.type == "delete" then
-        -- Restore deleted strokes
-        for _, stroke in ipairs(last_action.strokes) do
+    end
+    return removed
+end
+
+function Pencil:afterHistoryChange()
+    self:rebuildPageIndex()
+    self:rebuildAnnotationGroups()
+    self:saveStrokes()
+    UIManager:setDirty(self.view, "ui")
+end
+
+-- Undo (undoing = true) or redo an action. Returns the action to push on
+-- the opposite stack, or nil if nothing could be applied.
+function Pencil:applyHistoryAction(action, undoing)
+    if action.type == "add" then
+        local stroke = action.stroke or (action.stroke_idx and self.strokes[action.stroke_idx])
+        if not stroke then return nil end
+        if undoing then
+            if not self:removeStrokes({ stroke }) then return nil end
+        else
             table.insert(self.strokes, stroke)
         end
-        self:rebuildPageIndex()
-        self:rebuildAnnotationGroups()
-        self:saveStrokes()
-        UIManager:setDirty(self.view, "ui")
+        return { type = "add", stroke = stroke }
+    elseif action.type == "delete" then
+        if undoing then
+            for _, stroke in ipairs(action.strokes) do
+                table.insert(self.strokes, stroke)
+            end
+        elseif not self:removeStrokes(action.strokes) then
+            return nil
+        end
+        return { type = "delete", strokes = action.strokes }
+    elseif action.type == "move" then
+        local sign = undoing and -1 or 1
+        self:translateStrokes(action.strokes, sign * action.dx, sign * action.dy)
+        return action
     end
+end
+
+function Pencil:undoLastStroke()
+    local action = table.remove(self.undo_stack)
+    if not action then return end
+    local redo = self:applyHistoryAction(action, true)
+    self.redo_stack = self.redo_stack or {}
+    if redo then table.insert(self.redo_stack, redo) end
+    self:afterHistoryChange()
+end
+
+function Pencil:redoLastStroke()
+    local action = self.redo_stack and table.remove(self.redo_stack)
+    if not action then return end
+    local undo = self:applyHistoryAction(action, false)
+    if undo then table.insert(self.undo_stack, undo) end
+    self:afterHistoryChange()
 end
 
 function Pencil:setupPenInput()
@@ -2814,7 +2893,7 @@ function Pencil:onDrawTap(ges)
         local erased = self:eraseAtPoint(ges.pos.x, ges.pos.y, page)
         if erased then
             logger.info("Pencil: erased", #erased, "strokes")
-            table.insert(self.undo_stack, { type = "delete", strokes = erased })
+            self:pushUndo({ type = "delete", strokes = erased })
             self:saveStrokes()
             UIManager:setDirty(self.view, "ui")
         else
@@ -2841,7 +2920,7 @@ function Pencil:onDrawTap(ges)
     self:saveStrokes()
 
     -- Add to undo stack
-    table.insert(self.undo_stack, { type = "add", stroke_idx = #self.strokes })
+    self:pushUndo({ type = "add", stroke_idx = #self.strokes })
 
     -- Draw directly to screen buffer
     self:renderStroke(Screen.bb, stroke)
@@ -2967,7 +3046,7 @@ function Pencil:onDrawPanRelease(ges)
     if effective_tool == TOOL_ERASER then
         if self.eraser_deleted and #self.eraser_deleted > 0 then
             -- Add deleted strokes to undo stack
-            table.insert(self.undo_stack, { type = "delete", strokes = self.eraser_deleted })
+            self:pushUndo({ type = "delete", strokes = self.eraser_deleted })
             self:saveStrokes()
         end
         -- Always refresh screen after erasing to clear any visual artifacts
@@ -2993,7 +3072,7 @@ function Pencil:onDrawPanRelease(ges)
         self:saveStrokes()
 
         -- Add to undo stack
-        table.insert(self.undo_stack, { type = "add", stroke_idx = #self.strokes })
+        self:pushUndo({ type = "add", stroke_idx = #self.strokes })
         self:assignStrokeToGroup(#self.strokes)
 
         logger.dbg("Pencil: stroke completed with", #self.current_stroke.points, "points")
@@ -4052,7 +4131,7 @@ function Pencil:clearPageStrokes()
     end
 
     if #deleted_strokes > 0 then
-        table.insert(self.undo_stack, { type = "delete", strokes = deleted_strokes })
+        self:pushUndo({ type = "delete", strokes = deleted_strokes })
     end
 
     self:rebuildPageIndex()
@@ -4705,6 +4784,7 @@ function Pencil:onCloseDocument()
     -- Clear state
     self.eraser_deleted = nil
     self.undo_stack = {}
+    self.redo_stack = {}
 
     if _active_pencil == self then _active_pencil = nil end
 end
@@ -4767,7 +4847,7 @@ function Pencil:onPageUpdate(pageno)
         self:anchorStrokeToPage(self.current_stroke)
         table.insert(self.strokes, self.current_stroke)
         self:indexStroke(#self.strokes, self.current_stroke.page)
-        table.insert(self.undo_stack, { type = "add", stroke_idx = #self.strokes })
+        self:pushUndo({ type = "add", stroke_idx = #self.strokes })
         self:flushDirtyGroups()
         self:saveStrokes()
     else
@@ -4791,7 +4871,7 @@ function Pencil:onUpdatePos()
         self:anchorStrokeToPage(self.current_stroke)
         table.insert(self.strokes, self.current_stroke)
         self:indexStroke(#self.strokes, self.current_stroke.page)
-        table.insert(self.undo_stack, { type = "add", stroke_idx = #self.strokes })
+        self:pushUndo({ type = "add", stroke_idx = #self.strokes })
         self:flushDirtyGroups()
         self:saveStrokes()
     else
