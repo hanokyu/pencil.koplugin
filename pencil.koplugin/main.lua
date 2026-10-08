@@ -695,6 +695,9 @@ function Pencil:addRawPoint(x, y)
     -- Draw to framebuffer and track dirty region
     local dirty_x, dirty_y, dirty_w, dirty_h
     if n == 1 then
+        if self.ui and self.ui.paging then
+            self:captureStrokeAnchor(self.current_stroke, x, y)
+        end
         -- Draw first point same size as line segments for consistency
         local half_w_draw = math.floor(width / 2)
         Screen.bb:paintRectRGB32(x - half_w_draw, y - half_w_draw, width, width, color)
@@ -769,6 +772,7 @@ function Pencil:endRawStroke()
             self.current_stroke and #self.current_stroke.points or 0))
     end
     if self.current_stroke and #self.current_stroke.points >= 1 then
+        self:anchorStrokeToPage(self.current_stroke)
         table.insert(self.strokes, self.current_stroke)
         self:indexStroke(#self.strokes, self.current_stroke.page)
         table.insert(self.undo_stack, { type = "add", stroke_idx = #self.strokes })
@@ -2627,8 +2631,9 @@ function Pencil:onDrawTap(ges)
         datetime = os.time(),
     }
 
+    self:anchorStrokeToPage(stroke)
     table.insert(self.strokes, stroke)
-    self:indexStroke(#self.strokes, page)
+    self:indexStroke(#self.strokes, stroke.page)
     self:saveStrokes()
 
     -- Add to undo stack
@@ -2778,6 +2783,7 @@ function Pencil:onDrawPanRelease(ges)
     -- Fallback: finalize stroke via gesture system
     if #self.current_stroke.points >= 1 then
         -- Finalize the stroke
+        self:anchorStrokeToPage(self.current_stroke)
         table.insert(self.strokes, self.current_stroke)
         self:indexStroke(#self.strokes, self.current_stroke.page)
         self:saveStrokes()
@@ -2799,6 +2805,103 @@ function Pencil:onDrawPanRelease(ges)
 end
 
 -- Get current page number (stable reference for both paged and rolling modes)
+-- PDF strokes are anchored to page coordinates so they follow zoom, pan,
+-- crop and rotation. On a paged view, screen = page * zoom + offset for
+-- each visible page; this returns zoom, offset_x, offset_y for `page`, or
+-- nil when the page isn't shown. Mirrors ReaderView:getSinglePageRect /
+-- getScrollPageRect without allocating per point.
+function Pencil:pageAffine(page)
+    local view = self.view
+    if not (self.ui and self.ui.paging and view and view.state) then return nil end
+    if view.page_scroll then
+        local acc_y = 0
+        local gap = view.page_gap and view.page_gap.height or 0
+        for _, st in ipairs(view.page_states or {}) do
+            if st.page == page then
+                return st.zoom, st.offset.x - st.visible_area.x,
+                       acc_y + st.offset.y - st.visible_area.y
+            end
+            acc_y = acc_y + st.visible_area.h + gap
+        end
+        return nil
+    end
+    if view.state.page ~= page or not view.visible_area then return nil end
+    return view.state.zoom, view.state.offset.x - view.visible_area.x,
+           view.state.offset.y - view.visible_area.y
+end
+
+-- Remember which page a new stroke starts on and that page's transform, so
+-- the stroke is anchored with the view it was drawn in even if it is saved
+-- after a page turn.
+function Pencil:captureStrokeAnchor(stroke, x, y)
+    local pos = self.view:screenToPageTransform({ x = x, y = y })
+    if not (pos and pos.page) then return end
+    local zoom, ox, oy = self:pageAffine(pos.page)
+    if not zoom or zoom == 0 then return end
+    stroke._anchor_page, stroke._anchor_zoom = pos.page, zoom
+    stroke._anchor_ox, stroke._anchor_oy = ox, oy
+end
+
+-- Give a finished PDF stroke page coordinates (page_points). No-op for
+-- reflowable documents.
+function Pencil:anchorStrokeToPage(stroke)
+    if not (self.ui and self.ui.paging) or stroke.page_points then return end
+    if not stroke._anchor_zoom and stroke.points and stroke.points[1] then
+        self:captureStrokeAnchor(stroke, stroke.points[1].x, stroke.points[1].y)
+    end
+    local zoom = stroke._anchor_zoom
+    if not zoom then return end
+    local ox, oy = stroke._anchor_ox, stroke._anchor_oy
+    local page_points = {}
+    for i, pt in ipairs(stroke.points) do
+        page_points[i] = { x = (pt.x - ox) / zoom, y = (pt.y - oy) / zoom }
+    end
+    stroke.page_points = page_points
+    stroke.page = stroke._anchor_page
+    -- The screen points already match this view.
+    stroke._vz, stroke._vox, stroke._voy = zoom, ox, oy
+    stroke._anchor_page, stroke._anchor_zoom = nil, nil
+    stroke._anchor_ox, stroke._anchor_oy = nil, nil
+end
+
+-- Bring a page-anchored stroke's screen points (stroke.points) in line with
+-- the current view. Cheap when the view hasn't changed.
+-- @return false if the stroke's page isn't visible
+function Pencil:syncStrokeToView(stroke)
+    local pp = stroke.page_points
+    if not pp then return true end
+    local zoom, ox, oy = self:pageAffine(stroke.page)
+    if not zoom then return false end
+    if stroke._vz == zoom and stroke._vox == ox and stroke._voy == oy then
+        return true
+    end
+    local points = stroke.points or {}
+    for i, q in ipairs(pp) do
+        local pt = points[i]
+        if not pt then
+            pt = {}
+            points[i] = pt
+        end
+        pt.x = q.x * zoom + ox
+        pt.y = q.y * zoom + oy
+    end
+    for i = #points, #pp + 1, -1 do points[i] = nil end
+    stroke.points = points
+    stroke._vz, stroke._vox, stroke._voy = zoom, ox, oy
+    return true
+end
+
+-- Pages whose strokes should be drawn / erased: every visible page in PDF
+-- continuous mode, otherwise just the current page.
+function Pencil:getVisiblePages()
+    local page = self:getCurrentPage()
+    if self.ui and self.ui.paging and self.view and self.view.page_scroll then
+        local list = self.view:getCurrentPageList()
+        if list and #list > 0 then return list, page end
+    end
+    return { page }, page
+end
+
 function Pencil:getCurrentPage()
     if self.ui.paging then
         return self.view.state.page
@@ -3524,6 +3627,13 @@ function Pencil:renderRotationBadge(bb, group)
         rect.w - 2 * inset, rect.h - 2 * inset, Blitbuffer.COLOR_WHITE)
 end
 
+-- Page-anchored (PDF) strokes render correctly in any rotation, so their
+-- groups never need a rotation badge.
+function Pencil:isGroupPageAnchored(group)
+    local first = group.stroke_indices and self.strokes[group.stroke_indices[1]]
+    return first ~= nil and first.page_points ~= nil
+end
+
 -- Compute the list of stale-rotation groups whose badges should be drawn on
 -- the current page in the current rotation. Returns nil if no badges should
 -- show (no stale groups, or suppressed because a native annotation is also
@@ -3538,7 +3648,8 @@ function Pencil:getStaleGroupsForCurrentView()
         local gpage = self:getGroupCurrentPage(group)
         if gpage == page then
             if group.image_rotation == nil
-                    or group.image_rotation == current_rot then
+                    or group.image_rotation == current_rot
+                    or self:isGroupPageAnchored(group) then
                 has_native = true
             elseif group.image_path then
                 stale = stale or {}
@@ -3910,13 +4021,18 @@ function Pencil:eraseAtPoint(x, y, page, defer_groups)
     local deleted = {}
     local indices_to_remove = {}
 
-    -- Iterate only strokes on the current page via the page index. Keeps the
+    -- Iterate only strokes on the visible pages via the page index. Keeps the
     -- per-sample erase cost O(strokes-on-page) instead of O(total-strokes).
-    local page_indices = self.page_strokes and self.page_strokes[page] or nil
-    if page_indices then
+    -- Legacy screen-space strokes are only drawn on the current page, so
+    -- they're only erasable there.
+    local pages = self.ui and self.ui.paging and self:getVisiblePages() or { page }
+    for _, p in ipairs(pages) do
+        local page_indices = self.page_strokes and self.page_strokes[p] or {}
         for _, i in ipairs(page_indices) do
             local stroke = self.strokes[i]
-            if stroke then
+            local erasable = stroke and (stroke.page_points and self:syncStrokeToView(stroke)
+                or (not stroke.page_points and p == page))
+            if erasable then
                 if self.input_debug_mode and stroke.points and #stroke.points > 0 then
                     local min_x, max_x, min_y, max_y = stroke.points[1].x, stroke.points[1].x, stroke.points[1].y, stroke.points[1].y
                     for _, pt in ipairs(stroke.points) do
@@ -4046,7 +4162,8 @@ function Pencil:paintTo(bb, x, y)
                 groups_with_image = groups_with_image + 1
             end
             if group.image_rotation == nil
-                    or group.image_rotation == current_rot then
+                    or group.image_rotation == current_rot
+                    or self:isGroupPageAnchored(group) then
                 -- Renders natively (same rotation as capture, or legacy group
                 -- without rotation info — render strokes as-is).
                 has_native_annotation = true
@@ -4088,13 +4205,21 @@ function Pencil:paintTo(bb, x, y)
         }
     end
 
-    -- Render saved strokes for current page (skipping stale ones).
-    local indices = self.page_strokes[page] or {}
-    for _, idx in ipairs(indices) do
-        if not (stale_indices and stale_indices[idx]) then
+    -- Render saved strokes for the visible pages (skipping stale ones).
+    -- Page-anchored (PDF) strokes are valid in any rotation, so they are
+    -- never treated as stale; legacy screen-space strokes only draw on the
+    -- current page.
+    for _, p in ipairs(self:getVisiblePages()) do
+        for _, idx in ipairs(self.page_strokes[p] or {}) do
             local stroke = self.strokes[idx]
             if stroke then
-                self:renderStroke(bb, stroke)
+                if stroke.page_points then
+                    if self:syncStrokeToView(stroke) then
+                        self:renderStroke(bb, stroke)
+                    end
+                elseif p == page and not (stale_indices and stale_indices[idx]) then
+                    self:renderStroke(bb, stroke)
+                end
             end
         end
     end
@@ -4250,6 +4375,8 @@ function Pencil:strokeToSaveable(stroke)
         -- v4: points packed as a single "x y x y ..." string instead of an
         -- array of {x=,y=} tables, so the serializer doesn't walk every point.
         p = PencilGeometry.packPoints(stroke.points),
+        -- PDF strokes: page coordinates, the source of truth for rendering.
+        pp = stroke.page_points and PencilGeometry.packPoints(stroke.page_points) or nil,
         color_name = stroke.color_name,  -- Save color name for persistence
     }
 end
@@ -4289,6 +4416,7 @@ function Pencil:strokeFromSaved(saved)
         alpha = saved.alpha or tool_settings.alpha,
         datetime = saved.datetime,
         points = points,
+        page_points = saved.pp and PencilGeometry.unpackPoints(saved.pp) or nil,
     }
 end
 
@@ -4350,6 +4478,7 @@ function Pencil:onCloseDocument()
     -- Save any in-progress stroke
     if self.current_stroke and #self.current_stroke.points >= 2 then
         logger.info("Pencil: saving in-progress stroke before close")
+        self:anchorStrokeToPage(self.current_stroke)
         table.insert(self.strokes, self.current_stroke)
         self:indexStroke(#self.strokes, self.current_stroke.page)
         self.current_stroke = nil
@@ -4431,6 +4560,7 @@ function Pencil:onPageUpdate(pageno)
         -- Save the stroke before clearing. The inline saveStrokes below covers
         -- everything in self.strokes, so drop any queued debounced save first.
         self:cancelPendingSave()
+        self:anchorStrokeToPage(self.current_stroke)
         table.insert(self.strokes, self.current_stroke)
         self:indexStroke(#self.strokes, self.current_stroke.page)
         table.insert(self.undo_stack, { type = "add", stroke_idx = #self.strokes })
@@ -4454,6 +4584,7 @@ function Pencil:onUpdatePos()
     -- Clear any in-progress stroke when position changes
     if self.current_stroke and #self.current_stroke.points >= 2 then
         self:cancelPendingSave()
+        self:anchorStrokeToPage(self.current_stroke)
         table.insert(self.strokes, self.current_stroke)
         self:indexStroke(#self.strokes, self.current_stroke.page)
         table.insert(self.undo_stack, { type = "add", stroke_idx = #self.strokes })
