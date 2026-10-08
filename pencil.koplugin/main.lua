@@ -57,6 +57,7 @@ local IMAGE_CAPTURE_DEBOUNCE_S = 4       -- seconds after last stroke before cap
 local IMAGE_BADGE_SIZE = 48              -- on-page badge edge (px) when annotation is stale
 local IMAGE_BADGE_HIT_PAD = 32           -- extra pixels around badge for tap hit-test
 local IMAGE_BADGE_MARGIN_GAP = 5         -- gap from text/screen edge for margin badge
+local STROKES_PATH_SETTING = "pencil_strokes_path"
 
 -- Module-level reference to the most recently initialized Pencil instance.
 -- Used by the bookmark-list hook (a class-level monkey-patch installed once)
@@ -3007,13 +3008,27 @@ end
 
 -- Get the bookmark page reference for a group.
 -- For paging mode (PDF), this is the page number.
--- For rolling mode (EPUB), this must be an XPointer.
-function Pencil:getBookmarkPageRef(group_page)
+-- For rolling mode (EPUB), a valid XPointer, or nil. KOReader can't sort
+-- an invalid one. Two make its sort fail and the book won't open (#84).
+function Pencil:getBookmarkPageRef(group)
     if self.ui.rolling and self.ui.document and self.ui.document.getPageXPointer then
-        -- group.page is a number (from getCurrentPage), convert back to XPointer
-        return self.ui.document:getPageXPointer(group_page)
+        local doc = self.ui.document
+        local function valid(xp)
+            return type(xp) == "string" and xp ~= "" and doc:isXPointerInDocument(xp)
+        end
+        -- The ink's own XPointer. It follows the ink through font changes
+        -- and rotation.
+        if valid(group.xpointer) then
+            return group.xpointer
+        end
+        -- The page's start. Past the end of the book this is "".
+        local xp = doc:getPageXPointer(group.page)
+        if valid(xp) then
+            return xp
+        end
+        return nil
     end
-    return group_page
+    return group.page
 end
 
 -- Sync a group's bookmark into KOReader's annotation system.
@@ -3032,8 +3047,12 @@ function Pencil:syncGroupBookmark(group)
         -- Remove existing bookmark for this group first
         self:removeGroupBookmark(group)
 
-        local pageno = self:getPageNumber(group.page)
-        local bookmark_page = self:getBookmarkPageRef(group.page)
+        local bookmark_page = self:getBookmarkPageRef(group)
+        if not bookmark_page then
+            logger.dbg("Pencil: no valid position for group", group.id, "- no bookmark")
+            return
+        end
+        local pageno = self:getPageNumber(bookmark_page)
         local chapter = ""
         if self.ui.toc and self.ui.toc.getTocTitleByPage then
             chapter = self.ui.toc:getTocTitleByPage(bookmark_page) or ""
@@ -3998,9 +4017,59 @@ function Pencil:getStrokesFilePath()
     return nil
 end
 
+-- Store the plugin-owned strokes file path in the document metadata.
+function Pencil:rememberStrokesFilePath(filepath)
+    local settings = self.ui and self.ui.doc_settings
+    if settings and filepath then
+        settings:saveSetting(STROKES_PATH_SETTING, filepath)
+    end
+end
+
+-- Recover pencil_strokes.lua after KOReader moves metadata.lua to a new
+-- sidecar following a document rename. Both paths are assumed to be on the
+-- same filesystem, so os.rename provides an atomic move.
+function Pencil:migrateStrokesFileIfNeeded()
+    local current = self:getStrokesFilePath()
+    local settings = self.ui and self.ui.doc_settings
+    if not current or not settings then return current end
+
+    if lfs.attributes(current, "mode") == "file" then
+        self:rememberStrokesFilePath(current)
+        return current
+    end
+
+    local previous = settings:readSetting(STROKES_PATH_SETTING)
+    if type(previous) ~= "string" or previous == "" or previous == current
+            or lfs.attributes(previous, "mode") ~= "file" then
+        return current
+    end
+
+    local old_sidecar = previous:match("^(.*)/[^/]+$")
+    local moved, err = os.rename(previous, current)
+    if not moved then
+        logger.warn("Pencil: failed to move strokes file from", previous,
+            "to", current, "error:", err)
+        return current
+    end
+
+    self:rememberStrokesFilePath(current)
+    logger.info("Pencil: moved strokes file from", previous, "to", current)
+
+    -- rmdir only succeeds when the legacy sidecar is empty. If KOReader or
+    -- another plugin left data there, it is preserved without extra handling.
+    if old_sidecar then
+        local removed = lfs.rmdir(old_sidecar)
+        if removed then
+            logger.info("Pencil: removed empty legacy sidecar", old_sidecar)
+        end
+    end
+
+    return current
+end
+
 -- Load strokes from our own file
 function Pencil:loadStrokes()
-    local filepath = self:getStrokesFilePath()
+    local filepath = self:migrateStrokesFileIfNeeded()
     logger.info("Pencil: loadStrokes - filepath =", filepath)
 
     if not filepath then
@@ -4050,6 +4119,7 @@ function Pencil:loadStrokes()
         end
 
         self.strokes_loaded = true
+        self:rememberStrokesFilePath(filepath)
         logger.info("Pencil: loaded", #self.strokes, "strokes from", filepath)
     else
         logger.warn("Pencil: failed to load strokes from", filepath, "error:", data)
@@ -4067,7 +4137,9 @@ function Pencil:strokeToSaveable(stroke)
         width = stroke.width,
         alpha = stroke.alpha,
         datetime = stroke.datetime,
-        points = stroke.points,
+        -- v4: points packed as a single "x y x y ..." string instead of an
+        -- array of {x=,y=} tables, so the serializer doesn't walk every point.
+        p = PencilGeometry.packPoints(stroke.points),
         color_name = stroke.color_name,  -- Save color name for persistence
     }
 end
@@ -4088,6 +4160,16 @@ function Pencil:strokeFromSaved(saved)
         end
     end
 
+    -- Points: v4 stores a packed "x y ..." string in `p`; v3 and earlier store
+    -- an array of {x=,y=} tables in `points`. Reconstruct the in-memory
+    -- {x=,y=} array either way.
+    local points
+    if saved.p ~= nil then
+        points = PencilGeometry.unpackPoints(saved.p)
+    else
+        points = saved.points or {}
+    end
+
     return {
         page = saved.page,
         tool = saved.tool,
@@ -4096,7 +4178,7 @@ function Pencil:strokeFromSaved(saved)
         color_name = saved.color_name,
         alpha = saved.alpha or tool_settings.alpha,
         datetime = saved.datetime,
-        points = saved.points,
+        points = points,
     }
 end
 
@@ -4117,14 +4199,6 @@ function Pencil:saveStrokes()
         return
     end
 
-    -- Ensure the directory exists
-    local sidecar_dir = self.ui.doc_settings.doc_sidecar_dir
-    if sidecar_dir then
-        local ok, err = lfs.mkdir(sidecar_dir)
-        if not ok and err ~= "File exists" then
-            logger.warn("Pencil: failed to create sidecar dir:", err)
-        end
-    end
 
     -- Convert strokes to saveable format (remove non-serializable values)
     local saveable_strokes = {}
@@ -4132,11 +4206,12 @@ function Pencil:saveStrokes()
         saveable_strokes[i] = self:strokeToSaveable(stroke)
     end
 
-    -- Serialize and write. Version 3 marks files that may contain image_path /
-    -- image_rotation fields on annotation groups; older readers can ignore
-    -- those fields and continue to use the strokes directly.
+    -- Serialize and write. Version 4 packs each stroke's points into a single
+    -- "x y x y ..." string (field `p`) instead of an array of {x=,y=} tables,
+    -- cutting serialize time + file size on heavily-annotated documents. v3 and
+    -- earlier (points array) still load via strokeFromSaved's fallback.
     local data = {
-        version = 3,
+        version = 4,
         strokes = saveable_strokes,
         annotation_groups = self.annotation_groups,
     }
@@ -4145,6 +4220,7 @@ function Pencil:saveStrokes()
     if f then
         f:write("return " .. require("dump")(data))
         f:close()
+        self:rememberStrokesFilePath(filepath)
         logger.info("Pencil: saved", #self.strokes, "strokes to", filepath)
     else
         logger.err("Pencil: failed to open file for writing:", filepath, "error:", err)
