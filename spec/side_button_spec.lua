@@ -20,7 +20,8 @@ local shown = {}
 
 local stubs = {
     ["ui/widget/container/inputcontainer"] = {
-        extend = function(_, o) return setmetatable(o or {}, { __index = make_stub() }) end,
+        -- No stub fallback: unset fields must read as nil, as in KOReader.
+        extend = function(_, o) return o or {} end,
     },
     ["ui/uimanager"] = setmetatable({
         show = function(_, widget) table.insert(shown, widget) end,

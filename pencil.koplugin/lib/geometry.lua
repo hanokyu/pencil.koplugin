@@ -211,4 +211,41 @@ function Geometry.captureStripRect(bbox, sw, sh, v_margin, min_h)
     return { x0 = 0, y0 = y0, x1 = sw, y1 = y1 }
 end
 
+--- Check if a point lies inside a polygon (even-odd rule).
+-- @param x number
+-- @param y number
+-- @param poly array of {x, y}; closed implicitly
+-- @return boolean
+function Geometry.pointInPolygon(x, y, poly)
+    local inside = false
+    local n = #poly
+    if n < 3 then return false end
+    local j = n
+    for i = 1, n do
+        local xi, yi = poly[i].x, poly[i].y
+        local xj, yj = poly[j].x, poly[j].y
+        if (yi > y) ~= (yj > y)
+                and x < (xj - xi) * (y - yi) / (yj - yi) + xi then
+            inside = not inside
+        end
+        j = i
+    end
+    return inside
+end
+
+--- Check if enough of a stroke's points lie inside a lasso polygon.
+-- @param stroke table with points array
+-- @param poly array of {x, y}
+-- @param min_ratio fraction of points that must be inside (default 0.6)
+-- @return boolean
+function Geometry.strokeInPolygon(stroke, poly, min_ratio)
+    if not stroke or not stroke.points or #stroke.points == 0 then return false end
+    min_ratio = min_ratio or 0.6
+    local inside = 0
+    for _, p in ipairs(stroke.points) do
+        if Geometry.pointInPolygon(p.x, p.y, poly) then inside = inside + 1 end
+    end
+    return inside / #stroke.points >= min_ratio
+end
+
 return Geometry

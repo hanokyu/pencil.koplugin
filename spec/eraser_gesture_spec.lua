@@ -103,7 +103,7 @@ local function new_pencil(opts)
     end
     p.saveStrokes = function(self)
         calls.saves = calls.saves + 1
-        calls.stale_at_save = self.erase_groups_stale
+        calls.stale_at_save = self.groups_stale
     end
     p:rebuildPageIndex()
     return p, calls
