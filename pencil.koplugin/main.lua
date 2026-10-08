@@ -604,6 +604,14 @@ function Pencil:teardownStylusCallback()
     logger.info("Pencil: stylus callback unregistered")
 end
 
+-- Luminance (0..255) of a Blitbuffer color, or nil when it can't be derived.
+local function colorLuminance(color)
+    if not color or not color.getColor8 then return nil end
+    local ok, c8 = pcall(color.getColor8, color)
+    if not ok or not c8 then return nil end
+    return c8.a
+end
+
 -- Start a new stroke from raw input
 function Pencil:startRawStroke()
     local page = self:getCurrentPage()
@@ -624,6 +632,31 @@ function Pencil:startRawStroke()
         alpha = tool_settings.alpha,
         datetime = os.time(),
     }
+
+    -- Resolve the effective draw color once per stroke. The night-mode
+    -- invert allocates a new FFI color object, so doing it per point puts
+    -- avoidable pressure on the GC during long strokes.
+    local draw_color = tool_settings.color
+    if Screen.night_mode and tool_settings.color_name ~= "Black" and tool_settings.color_name ~= "Gray"
+            and draw_color and draw_color.invert then
+        draw_color = draw_color:invert()
+    end
+    self.stroke_draw_color = draw_color
+
+    -- Decide the in-stroke refresh waveform once per stroke. Dark ink can
+    -- use the fast monochrome waveform (DU/A2 — what Kobo's own notebook
+    -- uses for live ink), which has far lower e-ink latency than the UI
+    -- waveform. Light shades (highlighter, gray) would get thresholded to
+    -- white and turn invisible mid-stroke, and color screens still need the
+    -- UI waveform to show non-black shades while drawing, so those keep
+    -- refreshUI. The final delayed refresh repaints everything at full
+    -- quality either way.
+    local lum = colorLuminance(draw_color)
+    local color_screen = Screen.isColorEnabled and Screen:isColorEnabled()
+    self.stroke_fast_refresh = Screen.refreshFast ~= nil
+        and lum ~= nil and lum < 0x80
+        and not (color_screen and tool_settings.color_name ~= "Black")
+
     self.last_refresh_time = time.now()
     self.dirty_region = nil  -- Clear any pending dirty region
     logger.dbg("Pencil: raw stroke started")
@@ -639,13 +672,9 @@ function Pencil:addRawPoint(x, y)
     local n = #self.current_stroke.points
 
     local width = self.current_stroke.width
-    local color = self.current_stroke.color
+    -- Effective color (night-mode invert included) resolved in startRawStroke
+    local color = self.stroke_draw_color or self.current_stroke.color
     local half_w = math.floor(width / 2) + 2  -- padding for antialiasing
-
-    -- Reinvert color in night mode (if it's not black or gray)
-    if Screen.night_mode and self.current_stroke.color_name ~= "Black" and self.current_stroke.color_name ~= "Gray" then
-        color = color:invert()
-    end
 
     -- Draw to framebuffer and track dirty region
     local dirty_x, dirty_y, dirty_w, dirty_h
@@ -675,14 +704,15 @@ function Pencil:addRawPoint(x, y)
 
     -- Accumulate dirty region for batch refresh
     if dirty_x then
-        if self.dirty_region then
-            -- Expand existing dirty region
-            local r = self.dirty_region
-            local new_x = math.min(r.x, dirty_x)
-            local new_y = math.min(r.y, dirty_y)
-            local new_x2 = math.max(r.x + r.w, dirty_x + dirty_w)
-            local new_y2 = math.max(r.y + r.h, dirty_y + dirty_h)
-            self.dirty_region = { x = new_x, y = new_y, w = new_x2 - new_x, h = new_y2 - new_y }
+        local r = self.dirty_region
+        if r then
+            -- Expand existing dirty region in place (no per-point alloc)
+            local x2 = math.max(r.x + r.w, dirty_x + dirty_w)
+            local y2 = math.max(r.y + r.h, dirty_y + dirty_h)
+            if dirty_x < r.x then r.x = dirty_x end
+            if dirty_y < r.y then r.y = dirty_y end
+            r.w = x2 - r.x
+            r.h = y2 - r.y
         else
             self.dirty_region = { x = dirty_x, y = dirty_y, w = dirty_w, h = dirty_h }
         end
@@ -699,8 +729,13 @@ function Pencil:addRawPoint(x, y)
             local ry = math.max(0, math.floor(r.y))
             local rw = math.min(Screen:getWidth() - rx, math.ceil(r.w))
             local rh = math.min(Screen:getHeight() - ry, math.ceil(r.h))
-            -- Use UI refresh mode for proper color rendering on color e-ink
-            Screen:refreshUI(rx, ry, rw, rh)
+            if self.stroke_fast_refresh then
+                -- Fast monochrome waveform: lowest e-ink latency for dark ink
+                Screen:refreshFast(rx, ry, rw, rh)
+            else
+                -- UI waveform: needed for proper shading of light/colored ink
+                Screen:refreshUI(rx, ry, rw, rh)
+            end
             self.dirty_region = nil
         end
     end
@@ -1718,18 +1753,22 @@ function Pencil:onDrawHold(ges)
     return true
 end
 
--- Schedule a delayed refresh after writing stops
+-- Schedule a delayed refresh after writing stops.
+-- NOTE: UIManager:scheduleIn() does not return a handle; unschedule() works
+-- by callback identity. Store the closure so cancelPendingRefresh can actually
+-- cancel it — otherwise every stroke leaves a full-screen repaint that fires
+-- mid-writing.
 function Pencil:scheduleDelayedRefresh()
-    -- Cancel any existing pending refresh
     self:cancelPendingRefresh()
-
-    -- Schedule new refresh
-    self.pending_refresh = UIManager:scheduleIn(self.refresh_delay_ms / 1000, function()
+    local fn = function()
         self.pending_refresh = nil
-        -- Do a fast refresh of the whole view to show all recent strokes
-        UIManager:setDirty(self.view, "fast")
+        -- Quality pass once writing stops: restores proper shading and clears
+        -- any fast-waveform ghosting left by in-stroke refreshes.
+        UIManager:setDirty(self.view, "ui")
         logger.dbg("Pencil: delayed refresh triggered")
-    end)
+    end
+    self.pending_refresh = fn
+    UIManager:scheduleIn(self.refresh_delay_ms / 1000, fn)
 end
 
 -- Cancel pending refresh (called when new stroke starts)
@@ -1741,13 +1780,24 @@ function Pencil:cancelPendingRefresh()
 end
 
 -- Schedule a debounced save + bookmark flush after writing pauses.
+-- Same handle-vs-callback story as scheduleDelayedRefresh: store the closure
+-- so cancelPendingSave can actually unschedule it. Also guard against firing
+-- while the pen is still down to avoid O(N) serialization mid-stroke.
 function Pencil:scheduleDeferredWork()
     self:cancelPendingSave()
-    self.pending_save = UIManager:scheduleIn(self.save_delay_ms / 1000, function()
+    local fn
+    fn = function()
+        if self.pen_down or self.current_stroke then
+            -- Pen still active; re-arm for another full debounce window.
+            UIManager:scheduleIn(self.save_delay_ms / 1000, fn)
+            return
+        end
         self.pending_save = nil
         self:flushDirtyGroups()
         self:saveStrokes()
-    end)
+    end
+    self.pending_save = fn
+    UIManager:scheduleIn(self.save_delay_ms / 1000, fn)
 end
 
 function Pencil:cancelPendingSave()
@@ -3232,7 +3282,13 @@ function Pencil:scheduleGroupImageCapture(group, delay)
 
     self:cancelGroupImageCapture(group.id)
 
-    local cb = function()
+    local cb
+    cb = function()
+        -- Offscreen page repaint + JPEG encode is heavy; postpone if pen is active.
+        if self.pen_down or self.current_stroke then
+            UIManager:scheduleIn(IMAGE_CAPTURE_DEBOUNCE_S, cb)
+            return
+        end
         self.pending_image_captures[group.id] = nil
         -- The group might have been deleted by the eraser by now.
         local current = nil
