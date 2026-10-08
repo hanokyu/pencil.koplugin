@@ -405,6 +405,15 @@ function Pencil:filterPalmSlots(input)
                 else
                     self.finger_slots[key] = true
                 end
+                if self.input_debug_mode then
+                    local pen = input.ev_slots and input.pen_slot and input.ev_slots[input.pen_slot]
+                    self:writeDebugLog(string.format(
+                        "PALM: touch start slot=%s id=%s x=%s y=%s -> %s (enabled=%s pen_slot_tool=%s stylus_age_ms=%s)",
+                        tostring(key), tostring(s.id), tostring(s.x), tostring(s.y),
+                        suppress and "DROPPED" or "passed", tostring(enabled),
+                        tostring(pen and pen.tool),
+                        self.last_stylus_time and tostring(time.to_ms(time.now() - self.last_stylus_time)) or "never"))
+                end
             end
         end
     end
@@ -871,7 +880,7 @@ function Pencil:cancelUnderlineHold()
 end
 
 -- Fired after the pen rested UNDERLINE_HOLD_MS: if the stroke so far is a
--- roughly horizontal line under text, turn it into a native underline.
+-- roughly horizontal line under text, turn it into a native highlight.
 function Pencil:checkUnderlineHold()
     local stroke = self.current_stroke
     if not (self.pen_down and stroke and not self.highlighting) then return end
@@ -906,7 +915,7 @@ function Pencil:findTextAbove(x, y)
     end
 end
 
--- Save a native KOReader underline over the text above a stroke bbox.
+-- Save a native KOReader highlight over the text above a stroke bbox.
 -- @return true if a highlight was saved
 function Pencil:underlineTextAbove(bbox)
     if not (self.ui and self.ui.highlight and self.ui.view and self.ui.document) then
@@ -921,7 +930,7 @@ function Pencil:underlineTextAbove(bbox)
     local ok, selected = pcall(self.ui.document.getTextFromPositions,
                                self.ui.document, start_pos, end_pos)
     if not (ok and selected and selected.pos0 and selected.pos1) then return false end
-    selected.drawer = "underscore"
+    -- No drawer set: saveHighlight uses the reader's default highlight style.
 
     local rh = self.ui.highlight
     rh.selected_text = selected
@@ -1497,8 +1506,8 @@ function Pencil:addToMainMenu(menu_items)
                         end,
                     },
                     {
-                        text = _("Underline by holding at line end"),
-                        help_text = _("Draw a line under text and rest the pen at the end for a moment: the ink is replaced by a native KOReader underline on the words above it."),
+                        text = _("Highlight by holding at line end"),
+                        help_text = _("Draw a line under text and rest the pen at the end for a moment: the ink is replaced by a native KOReader highlight (in your default highlight style) on the words above it."),
                         checked_func = function()
                             return self.underline_hold
                         end,

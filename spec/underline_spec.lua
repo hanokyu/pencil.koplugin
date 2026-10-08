@@ -139,12 +139,12 @@ describe("underline by holding at line end (real main.lua)", function()
         for fn in pairs(scheduled) do scheduled[fn] = nil end
     end)
 
-    it("turns a held horizontal line under text into a native underline", function()
+    it("turns a held horizontal line under text into a native highlight", function()
         local p, saved = new_pencil()
         draw(p, { { 100, 126 }, { 200, 127 }, { 300, 126 }, { 400, 128 } })
         fire_scheduled()
         assert.are.equal(1, #saved)
-        assert.are.equal("underscore", saved[1].drawer)
+        assert.is_nil(saved[1].drawer) -- default highlight style
         assert.are.equal(100 + 2, saved[1].pos0.x)
         assert.is_true(saved[1].pos0.y >= 100 and saved[1].pos0.y <= 120)
         lift(p)
