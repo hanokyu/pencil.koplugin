@@ -21,7 +21,7 @@ Back up your books' `.sdr` folders before switching to this fork. Strokes saved 
 
 With [Storefront](https://github.com/ultimatejimmy/storefront.koplugin): refresh the catalog, search for **pencil**, open **hanokyu/pencil.koplugin** and choose **Install from branch… → main**. Storefront then shows an update whenever `main` changes. Don't apply an update to the upstream pencil entry, as it would replace this fork.
 
-You still need the patched `input.lua` from this repo (see [Instructions for Installation](#instructions-for-installation)).
+On KOReader 2026.07 or newer nothing else is needed. Older KOReader versions also need the patched `input.lua` from this repo (see [Instructions for Installation](#instructions-for-installation)).
 
 ## Information
 
@@ -54,8 +54,8 @@ If you resize your book while reading it, your annotations will be WONKY. Get yo
 
 ## Instructions for Installation
 
-1. Download both the `pencil.koplugin` directory and the `input.lua` file from this repository.
-2. Replace the `/frontend/device/input.lua` with the downloaded file. This enables the plugin to intercept the stylus input, separate it from touch inputs, and detect the eraser end.
+1. Download the `pencil.koplugin` directory from this repository.
+2. **Only on KOReader older than 2026.07:** also download `input.lua` and replace KOReader's `/frontend/device/input.lua` with it. This enables the plugin to intercept the stylus input, separate it from touch inputs, and detect the eraser end. KOReader 2026.07 and newer already include this stylus support, so leave their `input.lua` alone: the copy here is older and would replace a newer file.
 3. Copy the `pencil.koplugin` directory into the `/plugins` directory of KOReader.
 
 ## Configuring the Pencil Plugin
