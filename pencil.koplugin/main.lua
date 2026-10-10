@@ -410,8 +410,10 @@ function Pencil:isPalmSlot(input, slot)
     if slot.slot == nil then return false end  -- can't tell without a slot number
     if input then
         if input.pen_slot ~= nil and slot.slot == input.pen_slot then return false end
-        if tool == 2 and input.kobo_eraser_active then return false end
-        if tool == 3 and input.kobo_highlighter_active then return false end
+        -- Latch names: KOReader 2026.07+ (stylus_*) and the older patched
+        -- input.lua shipped with this plugin (kobo_*).
+        if tool == 2 and (input.stylus_eraser_active or input.kobo_eraser_active) then return false end
+        if tool == 3 and (input.stylus_highlighter_active or input.kobo_highlighter_active) then return false end
     end
     if self.learned_pen_slot ~= nil and slot.slot == self.learned_pen_slot then return false end
     return true

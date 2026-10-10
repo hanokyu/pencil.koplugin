@@ -168,6 +168,13 @@ describe("palm rejection (real main.lua)", function()
             assert.is_true(p:isPalmSlot({ kobo_eraser_active = true }, slot(1, 3)))
         end)
 
+        it("understands KOReader 2026.07's stylus latch names", function()
+            local p = new_pencil()
+            assert.is_false(p:isPalmSlot({ stylus_eraser_active = true }, slot(1, 2)))
+            assert.is_false(p:isPalmSlot({ stylus_highlighter_active = true }, slot(1, 3)))
+            assert.is_true(p:isPalmSlot({ stylus_eraser_active = true }, slot(1, 3)))
+        end)
+
         it("swallows a palm before it can erase", function()
             local p = new_pencil()
             local erased = false
